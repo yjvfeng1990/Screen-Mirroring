@@ -35,3 +35,17 @@ qrc_*.cpp
 *.tmp
 Thumbs.db
 .DS_Store
+*.pcapng
+*.msi
+
+# 未打通的能力(暂不入库)
+MiracastReceiverSample/
+WinMiracastReceiver/
+
+# 调试辅助脚本
+run_uxplay*.bat
+setup_msys.sh
+start_uxplay.ps1
+tools/
+bonjour-msi/
+0

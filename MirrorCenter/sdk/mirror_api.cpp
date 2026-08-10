@@ -376,6 +376,13 @@ MIRROR_API mirror_result_t mirror_start_session(mirror_backend_t backend,
         argList << QStringLiteral("-n") << name;
     }
 
+    // AirPlay:默认用 d3d11videosink 输出。MirrorCenter 定制的 uxplay 靠
+    // d3d11 窗口标题 "Direct3D11" 定位子窗口并输出 WINDOW_HANDLE 协议,
+    // 只有指定该 sink 时窗口嵌入才生效;若调用方显式传了 -vs 则尊重其选择。
+    if (type == BackendType::AirPlay && !argList.contains(QStringLiteral("-vs"))) {
+        argList << QStringLiteral("-vs") << QStringLiteral("d3d11videosink");
+    }
+
 #ifdef _WIN32
     // Windows Miracast 帧模式:分配空闲端口,通过 miracast:// 协议激活 UWP 接收进程,
     // Qt 侧连该端口收帧。不用 QProcess/explorer 启动 —— explorer 会把协议 URL 当作

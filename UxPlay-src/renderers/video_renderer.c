@@ -175,6 +175,11 @@ static gboolean adjust_window_timer_cb (gpointer user_data) {
     if (g_video_ratio_w > 0 && g_video_ratio_h > 0) {
         adjust_window_to_video_ratio (g_video_ratio_w, g_video_ratio_h);
     }
+    /* The d3d11videosink window is only created when the first frame is
+     * rendered, which may happen after the sink caps are negotiated.  Keep
+     * trying to emit WINDOW_HANDLE from this periodic timer until the window
+     * is found, so MirrorCenter can embed it. */
+    emit_window_handle_once ();
     return G_SOURCE_CONTINUE;
 }
 
