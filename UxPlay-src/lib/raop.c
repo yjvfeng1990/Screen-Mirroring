@@ -799,6 +799,12 @@ raop_get_port(raop_t *raop) {
     return raop->port;
 }
 
+const char *
+raop_get_pk_str(raop_t *raop) {
+    assert(raop);
+    return raop->pk_str;
+}
+
 void *
 raop_get_callback_cls(raop_t *raop) {
     assert(raop);

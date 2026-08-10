@@ -116,26 +116,33 @@ static char jpeg[] = "jpeg";
 static int g_video_ratio_w = 0;
 static int g_video_ratio_h = 0;
 
-/* Find the d3d11videosink render window (its title contains "Direct3D11"). */
+/* Find this process's d3d11videosink render window (its title contains
+ * "Direct3D11").  Only windows created by this process are considered:
+ * several silent uxplay instances may run concurrently (one per device). */
 static BOOL CALLBACK find_d3d11_window_enum (HWND hwnd, LPARAM lparam) {
     wchar_t title[256];
     if (GetWindowTextW (hwnd, title, 256) > 0 && wcsstr (title, L"Direct3D11")) {
-        *((HWND *) lparam) = hwnd;
-        return FALSE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId (hwnd, &pid);
+        if (pid == GetCurrentProcessId ()) {
+            *((HWND *) lparam) = hwnd;
+            return FALSE;
+        }
     }
     return TRUE;
 }
 
-/* Emit "WINDOW_HANDLE=<hwnd>" once to stdout when the d3d11videosink window
- * appears.  MirrorCenter parses this from uxplay's stdout and embeds the
- * window into its own UI. */
-static bool g_handle_emitted = false;
+/* Emit "WINDOW_HANDLE=<hwnd>" to stdout whenever the d3d11videosink window
+ * (re)appears.  MirrorCenter parses this from uxplay's stdout and embeds the
+ * window into its own UI.  The window is destroyed when a stream stops, so on
+ * a new connection the sink creates a fresh window and a NEW handle must be
+ * emitted again (only emitted when the handle actually changes). */
 static void emit_window_handle_once (void) {
-    if (g_handle_emitted) return;
+    static HWND last_handle = NULL;
     HWND hwnd = NULL;
     EnumWindows (find_d3d11_window_enum, (LPARAM) &hwnd);
-    if (!hwnd) return;
-    g_handle_emitted = true;
+    if (!hwnd || hwnd == last_handle) return;
+    last_handle = hwnd;
     g_print ("WINDOW_HANDLE=%" PRIuPTR "\n", (uintptr_t) hwnd);
     fflush (stdout);
 }
@@ -183,6 +190,10 @@ static gboolean adjust_window_timer_cb (gpointer user_data) {
     return G_SOURCE_CONTINUE;
 }
 
+/* Walk the pipeline and report the actual video decoder factory name.
+ * Forward declaration: on_video_sink_caps is defined before report_video_decoder. */
+static void report_video_decoder (GstElement *pipeline);
+
 /* Diagnostic: log the actual video caps received by the video sink */
 static void on_video_sink_caps (GstPad *pad, GParamSpec *pspec, gpointer user_data) {
     GstCaps *caps = gst_pad_get_current_caps (pad);
@@ -194,8 +205,64 @@ static void on_video_sink_caps (GstPad *pad, GParamSpec *pspec, gpointer user_da
         g_video_ratio_w = w;
         g_video_ratio_h = h;
         emit_window_handle_once ();
+        /* Caps negotiated => decodebin has chosen the actual decoder.
+         * Report it so the gateway can tell software from hardware decode. */
+        report_video_decoder ((GstElement *) user_data);
     }
     gst_caps_unref (caps);
+}
+
+/* Walk the pipeline bin (recursively) and print the factory name of the
+ * video decoder element that decodebin actually instantiated, e.g.
+ * MIRROR_DECODER=avdec_h264 (software) or MIRROR_DECODER=d3d11h264dec
+ * (hardware).  Only reported once per process (each silent uxplay instance
+ * is its own process). */
+static void report_video_decoder (GstElement *pipeline) {
+    if (!pipeline || !GST_IS_BIN (pipeline))
+        return;
+    static gboolean reported = FALSE;
+    if (reported)
+        return;
+
+    GstIterator *it = gst_bin_iterate_recurse (GST_BIN (pipeline));
+    if (!it)
+        return;
+    gboolean done = FALSE;
+    while (!done) {
+        GValue item = G_VALUE_INIT;
+        switch (gst_iterator_next (it, &item)) {
+            case GST_ITERATOR_OK: {
+                /* Iterator puts its own reference into item; g_value_unset
+                 * releases it.  Do NOT unref elem manually, or the element
+                 * gets freed while the data-flow threads still use it
+                 * (gst_adapter/g_object_ref assertions + access violation). */
+                GstElement *elem = GST_ELEMENT (g_value_get_object (&item));
+                GstElementFactory *f = gst_element_get_factory (elem);
+                if (f) {
+                    /* gst_element_get_factory returns a transfer-none pointer
+                     * (the factory is owned by the plugin registry).  Do NOT
+                     * unref it, or the registry refcount breaks and every
+                     * element logs "Trying to dispose object ... still has a
+                     * parent registry0" at shutdown. */
+                    const gchar *fname = gst_plugin_feature_get_name (GST_PLUGIN_FEATURE (f));
+                    if (fname && (strstr (fname, "h264dec") || strstr (fname, "h265dec")
+                                  || strstr (fname, "avdec_h264") || strstr (fname, "avdec_h265"))) {
+                        g_print ("MIRROR_DECODER=%s\n", fname);
+                        fflush (stdout);
+                        reported = TRUE;
+                    }
+                }
+                g_value_unset (&item);
+                break;
+            }
+            case GST_ITERATOR_DONE:
+                done = TRUE;
+                break;
+            default:
+                break;
+        }
+    }
+    gst_iterator_free (it);
 }
 #endif
 
@@ -525,7 +592,7 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
                 if (sink_elem) {
                     GstPad *sink_pad = gst_element_get_static_pad (sink_elem, "sink");
                     if (sink_pad) {
-                        g_signal_connect (sink_pad, "notify::caps", G_CALLBACK (on_video_sink_caps), NULL);
+                        g_signal_connect (sink_pad, "notify::caps", G_CALLBACK (on_video_sink_caps), renderer_type[i]->pipeline);
                         gst_object_unref (sink_pad);
                     }
                     gst_object_unref (sink_elem);
@@ -646,10 +713,13 @@ void video_renderer_start() {
     X11_search_attempts = 0;
 #endif
 #ifdef WIN32
-    /* Periodically match the render window's ratio to the current video size */
+    /* Periodically match the render window's ratio to the current video size,
+     * and find/emit new window handles as early as possible (50 ms) so the
+     * window spends as little time as possible on the desktop before
+     * MirrorCenter embeds it. */
     static guint adjust_window_timer = 0;
     if (adjust_window_timer == 0) {
-        adjust_window_timer = g_timeout_add (500, adjust_window_timer_cb, NULL);
+        adjust_window_timer = g_timeout_add (50, adjust_window_timer_cb, NULL);
     }
 #endif
 }

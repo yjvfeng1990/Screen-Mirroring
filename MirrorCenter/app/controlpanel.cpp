@@ -1,7 +1,4 @@
 #include "controlpanel.h"
-#include "sidebar.h"
-#include "topbar.h"
-#include "bottombar.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -9,22 +6,30 @@
 #include <QLabel>
 #include <QToolButton>
 #include <QMouseEvent>
+#include <QEnterEvent>
+#include <QEvent>
+#include <QTimer>
+#include <QApplication>
+#include <QScreen>
+#include <QCursor>
+#include <QPixmap>
+#include <QStyle>
 #include <QGraphicsDropShadowEffect>
-#include <QDebug>
+#include <algorithm>
 
 ControlPanel::ControlPanel(QWidget *parent)
     : QWidget(parent)
 {
-    // 无边框 + 置顶 + 工具窗口(不出现在任务栏)
+    // 无边框 + 置顶 + 工具窗口(不出现在任务栏), 不抢焦点(侧边栏交互)
     setWindowFlags(Qt::FramelessWindowHint
                    | Qt::WindowStaysOnTopHint
                    | Qt::Tool);
     setAttribute(Qt::WA_TranslucentBackground, true);  // 外层透明,圆角由 m_rootFrame 实现
-    setMinimumSize(820, 540);
-    resize(900, 600);
+    setAttribute(Qt::WA_ShowWithoutActivating, true);
+    setMinimumSize(300, 400);
+    resize(320, 600);
 
     buildUi();
-    wireSignals();
 
     // 阴影
     auto *shadow = new QGraphicsDropShadowEffect(this);
@@ -32,6 +37,45 @@ ControlPanel::ControlPanel(QWidget *parent)
     shadow->setOffset(0, 4);
     shadow->setColor(QColor(0, 0, 0, 160));
     m_rootFrame->setGraphicsEffect(shadow);
+
+    // ---- 侧边吸附(参考 TopDesk) ----
+    m_panelWidth = width();
+
+    // 触发条: 屏幕右边缘 8x44 的竖条, 悬停/点击展开
+    m_triggerButton = new QWidget(nullptr);
+    m_triggerButton->setWindowFlags(Qt::FramelessWindowHint
+                                    | Qt::WindowStaysOnTopHint
+                                    | Qt::Tool);
+    m_triggerButton->setAttribute(Qt::WA_ShowWithoutActivating, true);
+    m_triggerButton->setFixedSize(m_collapsedWidth, 44);
+    m_triggerButton->setStyleSheet(
+        "background-color:#20242E; border-top-left-radius:6px;"
+        "border-bottom-left-radius:6px;");
+    m_triggerButton->setCursor(Qt::PointingHandCursor);
+    m_triggerButton->installEventFilter(this);
+
+    // 鼠标离开面板 300ms 后收起
+    m_hideTimer = new QTimer(this);
+    m_hideTimer->setInterval(300);
+    m_hideTimer->setSingleShot(true);
+    connect(m_hideTimer, &QTimer::timeout, this, [this]() {
+        if (m_dockedExpanded && !geometry().contains(QCursor::pos()))
+            collapse();
+    });
+
+    // 缩略图刷新节拍(仅展开时工作)
+    m_thumbTimer = new QTimer(this);
+    m_thumbTimer->setInterval(800);
+    connect(m_thumbTimer, &QTimer::timeout, this, [this]() {
+        if (m_dockedExpanded && isVisible())
+            refreshThumbnails();
+    });
+    m_thumbTimer->start();
+
+    // 初始: 展开吸附在屏幕右边缘
+    m_dockedExpanded = true;
+    updateDockGeometry();
+    updateTriggerPosition();
 }
 
 ControlPanel::~ControlPanel() = default;
@@ -53,29 +97,22 @@ void ControlPanel::buildUi()
     buildTitleBar();
     rfL->addWidget(m_titleBar);
 
-    // 内容区(Sidebar 左,TopBar+BottomBar 右)
-    auto *content = new QWidget(m_rootFrame);
-    content->setObjectName("ctrlPanelContent");
-    auto *contentL = new QHBoxLayout(content);
-    contentL->setContentsMargins(0, 0, 0, 0);
-    contentL->setSpacing(0);
+    // 来源列表区
+    m_listHost = new QWidget(m_rootFrame);
+    m_listHost->setObjectName("ctrlPanelContent");
+    m_listLayout = new QVBoxLayout(m_listHost);
+    m_listLayout->setContentsMargins(10, 10, 10, 10);
+    m_listLayout->setSpacing(8);
 
-    m_sidebar = new Sidebar(content);
-    contentL->addWidget(m_sidebar);
+    // 空状态
+    m_emptyLabel = new QLabel(QStringLiteral("暂无投屏设备\n投屏后显示播放器窗口列表"), m_listHost);
+    m_emptyLabel->setObjectName("ctrlPanelEmpty");
+    m_emptyLabel->setAlignment(Qt::AlignCenter);
+    m_emptyLabel->setWordWrap(true);
+    m_listLayout->addWidget(m_emptyLabel);
+    m_listLayout->addStretch(1);
 
-    auto *right = new QWidget(content);
-    auto *rL = new QVBoxLayout(right);
-    rL->setContentsMargins(0, 0, 0, 0);
-    rL->setSpacing(0);
-
-    m_topBar = new TopBar(right);
-    rL->addWidget(m_topBar);
-
-    m_bottomBar = new BottomControlBar(right);
-    rL->addWidget(m_bottomBar);
-
-    contentL->addWidget(right, 1);
-    rfL->addWidget(content, 1);
+    rfL->addWidget(m_listHost, 1);
 
     outer->addWidget(m_rootFrame);
 }
@@ -84,192 +121,250 @@ void ControlPanel::buildTitleBar()
 {
     m_titleBar = new QFrame();
     m_titleBar->setObjectName("ctrlPanelTitleBar");
-    m_titleBar->setFixedHeight(32);
+    m_titleBar->setFixedHeight(36);
     auto *tl = new QHBoxLayout(m_titleBar);
     tl->setContentsMargins(14, 0, 6, 0);
     tl->setSpacing(6);
 
-    // 小图标
-    auto *ico = new QLabel(QStringLiteral("🎛"));
+    auto *ico = new QLabel(QStringLiteral("🖥️"));
     ico->setStyleSheet("background-color:transparent; font-size:14px;");
     tl->addWidget(ico);
 
-    m_titleLabel = new QLabel(QStringLiteral("EdgeCast Studio · 控制台"));
+    m_titleLabel = new QLabel(QStringLiteral("播放器窗口"));
     m_titleLabel->setStyleSheet(
-        "color:#C2C9D6; font-size:12px; font-weight:600;"
+        "color:#C2C9D6; font-size:13px; font-weight:600;"
         "background-color:transparent;");
     tl->addWidget(m_titleLabel);
     tl->addStretch(1);
 
-    m_btnPin = new QToolButton();
-    m_btnPin->setObjectName("ctrlPanelTitleBtn");
-    m_btnPin->setText(QStringLiteral("📌"));
-    m_btnPin->setToolTip(QStringLiteral("置顶/取消置顶"));
-    m_btnPin->setFixedSize(24, 24);
-    m_btnPin->setCursor(Qt::PointingHandCursor);
-    tl->addWidget(m_btnPin);
-
     m_btnClose = new QToolButton();
     m_btnClose->setObjectName("ctrlPanelTitleBtn");
     m_btnClose->setText(QStringLiteral("×"));
-    m_btnClose->setToolTip(QStringLiteral("隐藏控制台(右下角按钮可重新唤出)"));
+    m_btnClose->setToolTip(QStringLiteral("收起到屏幕右边缘(悬停触发条可再次展开)"));
     m_btnClose->setFixedSize(24, 24);
     m_btnClose->setCursor(Qt::PointingHandCursor);
+    connect(m_btnClose, &QToolButton::clicked, this, [this]() {
+        collapse();
+        emit hideRequested();
+    });
     tl->addWidget(m_btnClose);
 }
 
-void ControlPanel::wireSignals()
+void ControlPanel::setThumbnailProvider(std::function<QPixmap(const QString &)> provider)
 {
-    // Sidebar → 转发
-    connect(m_sidebar, &Sidebar::navItemClicked,
-            this, &ControlPanel::navItemClicked);
-
-    // TopBar → 转发
-    connect(m_topBar, &TopBar::layoutOptionChanged, this, [this](const QString &text) {
-        int mode = 1;
-        if      (text.contains(QStringLiteral("单屏")))   mode = 1;
-        else if (text.contains(QStringLiteral("双拼")))   mode = 2;
-        else if (text.contains(QStringLiteral("三分屏"))) mode = 3;
-        else if (text.contains(QStringLiteral("四宫格"))) mode = 4;
-        else if (text.contains(QStringLiteral("六宫格"))) mode = 6;
-        else if (text.contains(QStringLiteral("自定义"))) mode = 99;
-        m_currentMode = mode;
-        m_bottomBar->setLayoutMode(mode);
-        emit layoutModeChanged(mode);
-    });
-    connect(m_topBar, &TopBar::fullscreenClicked,
-            this, &ControlPanel::fullscreenToggleRequested);
-    connect(m_topBar, &TopBar::recordScreenClicked,
-            this, &ControlPanel::recordScreenRequested);
-    connect(m_topBar, &TopBar::recordClicked,
-            this, &ControlPanel::recordRequested);
-    connect(m_topBar, &TopBar::helpClicked,
-            this, &ControlPanel::helpRequested);
-    connect(m_topBar, &TopBar::moreClicked,
-            this, &ControlPanel::moreRequested);
-
-    // BottomBar → 转发
-    connect(m_bottomBar, &BottomControlBar::layoutModeChanged,
-            this, [this](int mode) {
-                m_currentMode = mode;
-                m_topBar->setCurrentLayoutText(
-                    [mode]() {
-                        switch (mode) {
-                            case 1:  return QStringLiteral("单屏模式");
-                            case 2:  return QStringLiteral("双拼模式");
-                            case 3:  return QStringLiteral("三分屏模式");
-                            case 4:  return QStringLiteral("四宫格模式");
-                            case 6:  return QStringLiteral("六宫格模式");
-                            default: return QStringLiteral("自定义模式");
-                        }
-                    }());
-                emit layoutModeChanged(mode);
-            });
-    connect(m_bottomBar, &BottomControlBar::collapseToggled,
-            this, &ControlPanel::bottomCollapseToggled);
-
-    // 标题栏按钮
-    connect(m_btnClose, &QToolButton::clicked, this, [this]() {
-        setPanelVisible(false);
-        emit hideRequested();
-    });
-    connect(m_btnPin, &QToolButton::clicked, this, [this]() {
-        bool onTop = (windowFlags() & Qt::WindowStaysOnTopHint) != 0;
-        Qt::WindowFlags f = windowFlags();
-        if (onTop) f &= ~Qt::WindowStaysOnTopHint;
-        else       f |=  Qt::WindowStaysOnTopHint;
-        // Tool 标志需要保持
-        f |= Qt::Tool;
-        setWindowFlags(f);
-        show();  // 改 flags 后需要重新 show
-        m_btnPin->setText(onTop ? QStringLiteral("📍") : QStringLiteral("📌"));
-    });
+    m_thumbProvider = std::move(provider);
 }
 
-void ControlPanel::setNavGroups(const QList<Sidebar::NavGroup> &groups)
+void ControlPanel::setSources(const QList<SourceInfo> &sources)
 {
-    m_sidebar->setGroups(groups);
-}
-
-void ControlPanel::selectNavKey(const QString &key)
-{
-    m_sidebar->selectKey(key);
-}
-
-void ControlPanel::setLayoutMode(int mode)
-{
-    m_currentMode = mode;
-    m_bottomBar->setLayoutMode(mode);
-    QString text;
-    switch (mode) {
-        case 1:  text = QStringLiteral("单屏模式"); break;
-        case 2:  text = QStringLiteral("双拼模式"); break;
-        case 3:  text = QStringLiteral("三分屏模式"); break;
-        case 4:  text = QStringLiteral("四宫格模式"); break;
-        case 6:  text = QStringLiteral("六宫格模式"); break;
-        default: text = QStringLiteral("自定义模式"); break;
+    // 清空旧卡片
+    for (auto it = m_thumbLabels.begin(); it != m_thumbLabels.end(); ) {
+        QLabel *lbl = it.value();
+        if (lbl) {
+            QWidget *card = lbl->parentWidget();
+            if (card) {
+                card->deleteLater();
+                m_listLayout->removeWidget(card);
+            }
+        }
+        it = m_thumbLabels.erase(it);
     }
-    m_topBar->setCurrentLayoutText(text);
+    // 清掉可能残留的非空标签项(保险)
+    while (m_listLayout->count() > 2) {
+        QLayoutItem *item = m_listLayout->takeAt(0);
+        if (item->widget())
+            item->widget()->deleteLater();
+        delete item;
+    }
+
+    if (sources.isEmpty()) {
+        m_emptyLabel->show();
+        updateSelection();
+        return;
+    }
+    m_emptyLabel->hide();
+
+    // 选中项保持;若已断开则清除
+    if (m_selectedId.isEmpty() || !std::any_of(sources.begin(), sources.end(),
+            [this](const SourceInfo &s) { return s.sessionId == m_selectedId; })) {
+        m_selectedId.clear();
+    }
+
+    for (const SourceInfo &s : sources) {
+        auto *card = new QFrame(m_listHost);
+        card->setObjectName("srcItemCard");
+        card->setProperty("sessionId", s.sessionId);
+        card->setCursor(Qt::PointingHandCursor);
+        // 点击卡片 → 选中置顶
+        card->installEventFilter(this);
+        card->setToolTip(QStringLiteral("点击将 %1 窗口置于主窗口首位").arg(s.name));
+
+        auto *hl = new QHBoxLayout(card);
+        hl->setContentsMargins(10, 8, 10, 8);
+        hl->setSpacing(10);
+
+        // 缩略图
+        auto *thumb = new QLabel(card);
+        thumb->setObjectName("srcItemThumb");
+        thumb->setFixedSize(96, 54);
+        thumb->setAlignment(Qt::AlignCenter);
+        thumb->setStyleSheet(
+            "background-color:#0B0F1A; border-radius:6px;"
+            "border:1px solid rgba(255,255,255,10); color:#6B7488;"
+            "font-size:10px;");
+        thumb->setText(QStringLiteral("等待画面"));
+        hl->addWidget(thumb, 0, Qt::AlignVCenter);
+
+        // 名称(仅显示来源名称)
+        auto *name = new QLabel(s.name, card);
+        name->setObjectName("srcItemName");
+        name->setStyleSheet(
+            "color:#E8ECF4; font-size:14px; font-weight:600;"
+            "background-color:transparent;");
+        name->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
+        hl->addWidget(name, 1);
+        m_listLayout->insertWidget(m_listLayout->count() - 2, card);
+
+        m_thumbLabels.insert(s.sessionId, thumb);
+    }
+    updateSelection();
+    refreshThumbnails();
 }
 
-int ControlPanel::layoutMode() const
+void ControlPanel::refreshThumbnails()
 {
-    return m_currentMode;
+    if (!m_thumbProvider)
+        return;
+    for (auto it = m_thumbLabels.begin(); it != m_thumbLabels.end(); ++it) {
+        QLabel *lbl = it.value();
+        if (!lbl)
+            continue;
+        const QPixmap p = m_thumbProvider(it.key());
+        if (p.isNull())
+            continue;
+        // 画面无变化(cacheKey 相同)时跳过 setPixmap, 避免无谓重绘
+        const QPixmap cur = lbl->pixmap();
+        if (!cur.isNull() && cur.cacheKey() == p.cacheKey())
+            continue;
+        lbl->setText(QString());
+        lbl->setPixmap(p.scaled(lbl->size(),
+                                Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    }
 }
 
-void ControlPanel::setPanelVisible(bool visible)
+void ControlPanel::onItemClicked(const QString &sessionId)
 {
-    if (visible) {
-        show();
-        raise();
+    m_selectedId = sessionId;
+    updateSelection();
+    emit sourceSelected(sessionId);
+}
+
+void ControlPanel::updateSelection()
+{
+    for (int i = 0; i < m_listLayout->count(); ++i) {
+        QLayoutItem *item = m_listLayout->itemAt(i);
+        QWidget *w = item ? item->widget() : nullptr;
+        if (!w || w == m_emptyLabel)
+            continue;
+        const QString id = w->property("sessionId").toString();
+        const bool sel = (id == m_selectedId);
+        w->setProperty("selected", sel);
+        // 强制重绘 QSS
+        w->style()->unpolish(w);
+        w->style()->polish(w);
+    }
+}
+
+void ControlPanel::setPanelVisible(bool show)
+{
+    if (show) {
+        if (isHidden())
+            QWidget::show();
+        expand();
     } else {
-        hide();
+        collapse();
     }
 }
 
-void ControlPanel::mousePressEvent(QMouseEvent *e)
+bool ControlPanel::isPanelVisible() const
 {
-    // 拖动:仅响应标题栏区域的左键
-    if (e->button() == Qt::LeftButton) {
-        QPoint local = m_titleBar->mapFrom(this, e->pos());
-        if (m_titleBar->rect().contains(local)) {
-            m_dragging = true;
-            m_dragOffset = e->globalPosition().toPoint() - frameGeometry().topLeft();
-            e->accept();
-            return;
+    return isVisible() && m_dockedExpanded;
+}
+
+// ---- 侧边吸附(参考 TopDesk) ----
+
+void ControlPanel::expand()
+{
+    if (m_dockedExpanded)
+        return;
+    m_dockedExpanded = true;
+    updateDockGeometry();
+    m_triggerButton->hide();
+}
+
+void ControlPanel::collapse()
+{
+    if (!m_dockedExpanded)
+        return;
+    m_dockedExpanded = false;
+    updateDockGeometry();
+    updateTriggerPosition();
+    m_triggerButton->show();
+}
+
+void ControlPanel::updateDockGeometry()
+{
+    const QRect screen = QApplication::primaryScreen()->availableGeometry();
+    const int x = screen.right() - m_panelWidth
+                + (m_dockedExpanded ? 0 : m_collapsedWidth);
+    const int y = screen.center().y() - height() / 2;
+    setGeometry(x, y, m_panelWidth, height());
+}
+
+void ControlPanel::updateTriggerPosition()
+{
+    if (!m_triggerButton)
+        return;
+    const QRect screen = QApplication::primaryScreen()->availableGeometry();
+    const int y = screen.center().y() - m_triggerButton->height() / 2;
+    m_triggerButton->move(screen.right() - m_collapsedWidth + 1, y);
+}
+
+void ControlPanel::enterEvent(QEnterEvent *event)
+{
+    QWidget::enterEvent(event);
+    m_hideTimer->stop();
+    if (!m_dockedExpanded)
+        expand();
+}
+
+void ControlPanel::leaveEvent(QEvent *event)
+{
+    QWidget::leaveEvent(event);
+    if (m_dockedExpanded)
+        m_hideTimer->start();
+}
+
+bool ControlPanel::eventFilter(QObject *obj, QEvent *event)
+{
+    // 触发条: 悬停或点击 → 展开
+    if (obj == m_triggerButton) {
+        if (event->type() == QEvent::Enter || event->type() == QEvent::MouseButtonPress) {
+            if (!m_dockedExpanded)
+                expand();
+            return true;
+        }
+        return false;
+    }
+    // 列表卡片: 鼠标释放(点击) → 选中置顶
+    if (event->type() == QEvent::MouseButtonRelease) {
+        if (auto *w = qobject_cast<QWidget *>(obj)) {
+            const QString id = w->property("sessionId").toString();
+            if (!id.isEmpty()) {
+                onItemClicked(id);
+                return true;
+            }
         }
     }
-    QWidget::mousePressEvent(e);
-}
-
-void ControlPanel::mouseMoveEvent(QMouseEvent *e)
-{
-    if (m_dragging && (e->buttons() & Qt::LeftButton)) {
-        move(e->globalPosition().toPoint() - m_dragOffset);
-        e->accept();
-        return;
-    }
-    QWidget::mouseMoveEvent(e);
-}
-
-void ControlPanel::mouseReleaseEvent(QMouseEvent *e)
-{
-    if (m_dragging && e->button() == Qt::LeftButton) {
-        m_dragging = false;
-        e->accept();
-        return;
-    }
-    QWidget::mouseReleaseEvent(e);
-}
-
-void ControlPanel::mouseDoubleClickEvent(QMouseEvent *e)
-{
-    // 双击标题栏 = 切换全屏
-    QPoint local = m_titleBar->mapFrom(this, e->pos());
-    if (m_titleBar->rect().contains(local)) {
-        emit fullscreenToggleRequested();
-        e->accept();
-        return;
-    }
-    QWidget::mouseDoubleClickEvent(e);
+    return QWidget::eventFilter(obj, event);
 }

@@ -15,6 +15,7 @@
 #include <QTimer>
 #include <QDebug>
 #include <QMouseEvent>
+#include <QMetaObject>
 
 DesktopWindow::DesktopWindow(QWidget *parent)
     : QWidget(parent)
@@ -52,13 +53,13 @@ void DesktopWindow::buildUi()
     // ---- 中央画布 ----
     m_canvasInner = new QWidget(this);
     m_canvasInner->setStyleSheet("background-color: #05080F;");
-    auto *innerL = new QVBoxLayout(m_canvasInner);
-    innerL->setContentsMargins(12, 12, 12, 12);
-    innerL->setSpacing(0);
+    m_canvasLayout = new QVBoxLayout(m_canvasInner);
+    m_canvasLayout->setContentsMargins(12, 12, 12, 12);
+    m_canvasLayout->setSpacing(0);
     m_grid = new QGridLayout();
     m_grid->setContentsMargins(0, 0, 0, 0);
     m_grid->setSpacing(8);
-    innerL->addLayout(m_grid);
+    m_canvasLayout->addLayout(m_grid);
     root->addWidget(m_canvasInner, 1);
 
     // ---- 空状态卡片 ----
@@ -138,17 +139,68 @@ void DesktopWindow::setLayoutMode(int mode)
 
 void DesktopWindow::relayout()
 {
-    while (QLayoutItem *item = m_grid->takeAt(0)) {
-        if (QWidget *w = item->widget()) {
-            w->setParent(nullptr);
-            w->hide();
-        }
-        delete item;
+    const int maxG = maxGrid();
+    const int n = qMin(m_views.size(), maxG);
+
+    // 布局列数:0=按会话数自动(1全屏/2左右/3~4四宫格), 手动模式尊重控制台选择
+    // 受解码能力限制:软解最多 4 格, 硬解最多 16 格
+    int cols = 2, rows = (n + 1) / 2;
+    switch (m_layoutMode) {
+        case 0:
+            if (n == 1)      { cols = 1; rows = 1; }
+            else if (n == 2) { cols = 2; rows = 1; }
+            else if (n <= 4) { cols = 2; rows = 2; }
+            else if (n <= 6) { cols = 3; rows = 2; }
+            else if (n <= 9) { cols = 3; rows = 3; }
+            else if (n <= 12){ cols = 4; rows = 3; }
+            else             { cols = 4; rows = 4; }
+            break;
+        case 1: cols = 1; rows = n; break;
+        case 2: cols = 2; rows = (n + 1) / 2; break;
+        case 3: cols = 3; rows = (n + 2) / 3; break;
+        case 4: cols = 2; rows = 2; break;
+        case 6: cols = 3; rows = (n + 1) / 2; break;
+        default: break;
     }
+    cols = qMin(cols, n);
+
+    // 1 个投屏:铺满整窗(无边距无间隙);多路:细间隔;独占全屏时同样铺满
+    const bool fullBleed = (n == 1) || (m_focusView != nullptr);
+
+    // 当前应显示的视图序列(排除焦点外与超出解码上限的会话)
+    QList<SessionView *> shown;
+    if (!m_views.isEmpty()) {
+        for (SessionView *view : m_views) {
+            if (m_focusView && view != m_focusView)
+                continue;
+            if (shown.size() >= maxG)
+                continue;
+            shown.append(view);
+        }
+    }
+
+    // ---- 快速路径:布局无变化则跳过, 避免切换时重建容器导致闪烁 ----
+    if (m_lastShown == shown && m_lastCols == cols && m_lastRows == rows
+        && m_lastFullBleed == fullBleed && m_lastEmpty == m_views.isEmpty()) {
+        return;
+    }
+    m_lastShown = shown;
+    m_lastCols  = cols;
+    m_lastRows  = rows;
+    m_lastFullBleed = fullBleed;
+    m_lastEmpty = m_views.isEmpty();
+
+    // 只删除布局项, 不 reparent 视图 —— setParent(nullptr) 会重建嵌入的
+    // d3d11 原生窗口容器, 是切换/重排时画面闪烁的根源
+    while (QLayoutItem *item = m_grid->takeAt(0))
+        delete item;
+
+    m_canvasLayout->setContentsMargins(fullBleed ? 0 : 12, fullBleed ? 0 : 12,
+                                       fullBleed ? 0 : 12, fullBleed ? 0 : 12);
+    m_grid->setSpacing(fullBleed ? 0 : 4);
 
     if (m_views.isEmpty()) {
         if (m_emptyCard) {
-            m_emptyCard->setParent(m_canvasInner);
             m_emptyCard->show();
             m_grid->addWidget(m_emptyCard, 0, 0);
         }
@@ -157,39 +209,75 @@ void DesktopWindow::relayout()
         return;
     }
 
-    if (m_emptyCard) {
+    if (m_emptyCard)
         m_emptyCard->hide();
-        m_emptyCard->setParent(nullptr);
-    }
-
-    int cols = 1;
-    switch (m_layoutMode) {
-        case 1: cols = 1; break;
-        case 2: cols = 2; break;
-        case 3: cols = 3; break;
-        case 4: cols = 2; break;
-        case 6: cols = 3; break;
-        default: cols = qMin(m_views.size(), 3); break;
-    }
-    cols = qMin(cols, m_views.size());
 
     int row = 0, col = 0;
-    for (SessionView *view : m_views) {
+    for (SessionView *view : shown) {
         m_grid->addWidget(view, row, col);
         view->show();
         if (++col >= cols) { col = 0; ++row; }
     }
-    emit statusMessage(QStringLiteral("会话数: %1  ·  布局: %2 路")
-                           .arg(m_views.size()).arg(m_layoutMode));
+    // 隐藏未展示的会话(独占全屏外的 / 超出解码上限的)
+    for (SessionView *view : m_views) {
+        if (!shown.contains(view))
+            view->hide();
+    }
+    emit statusMessage(QStringLiteral("会话数: %1  ·  布局: %2 路%3")
+                           .arg(m_views.size())
+                           .arg(m_layoutMode ? m_layoutMode : qMax(1, cols))
+                           .arg(shown.size() < m_views.size()
+                                    ? QStringLiteral("  ·  超出解码上限, 仅显示 %1 路").arg(shown.size())
+                                    : QString()));
     emit sessionCountChanged(m_views.size());
+}
+
+void DesktopWindow::onViewFullscreen(const QString &sessionId)
+{
+    SessionView *target = nullptr;
+    for (SessionView *v : m_views) {
+        if (v->sessionId() == sessionId) { target = v; break; }
+    }
+    if (!target)
+        return;
+
+    if (m_focusView == target) {
+        // 还原:恢复自动布局
+        m_focusView = nullptr;
+        if (target)
+            target->setFullscreenActive(false);
+    } else {
+        m_focusView = target;
+        target->setFullscreenActive(true);
+    }
+    relayout();
 }
 
 void DesktopWindow::startAirPlay()
 {
-    if (m_airplayStarted) return;
-    addSession(QStringLiteral("MirrorCenter"), MIRROR_BACKEND_AIRPLAY);
-    m_airplayStarted = true;
-    emit statusMessage(QStringLiteral("AirPlay 接收已启动"));
+    if (m_gatewayStarted)
+        return;
+    m_gatewayStarted = true;
+
+    // 网关调度:唯一广播名 MirrorCenter, 内部按需启动静默 uxplay 实例,
+    // 设备断开 30s 回收, 30s 内重连续用原实例(由 SDK 网关层保证)。
+    mirror_gateway_callbacks_t cbs;
+    cbs.on_log                = &DesktopWindow::gatewayLogCallback;
+    cbs.on_client_connected   = &DesktopWindow::gatewayClientConnectedCallback;
+    cbs.on_client_disconnected = &DesktopWindow::gatewayClientDisconnectedCallback;
+    cbs.on_client_info        = &DesktopWindow::gatewayClientInfoCallback;
+    cbs.on_decoder            = &DesktopWindow::gatewayDecoderCallback;
+
+    const mirror_result_t rc = mirror_start_airplay_gateway(nullptr, nullptr,
+                                                            nullptr, nullptr,
+                                                            &cbs, this);
+    if (rc != MIRROR_OK) {
+        m_gatewayStarted = false;
+        emit statusMessage(QStringLiteral("AirPlay 网关启动失败: %1")
+                               .arg(QString::fromUtf8(mirror_last_error())));
+        return;
+    }
+    emit statusMessage(QStringLiteral("AirPlay 接收已启动(MirrorCenter, 多设备自动调度)"));
 }
 
 void DesktopWindow::startMiracast()
@@ -205,25 +293,220 @@ SessionView *DesktopWindow::addSession(const QString &name, mirror_backend_t bac
     auto *view = new SessionView(name, backend, m_canvasInner);
     connect(view, &SessionView::sessionClosed,
             this, &DesktopWindow::onSessionClosed);
+    connect(view, &SessionView::fullscreenRequested,
+            this, &DesktopWindow::onViewFullscreen);
     m_views.append(view);
     relayout();
+    emit sourcesChanged();
     return view;
+}
+
+QList<SourceItem> DesktopWindow::sourceItems() const
+{
+    QList<SourceItem> items;
+    for (SessionView *view : m_views) {
+        if (!view)
+            continue;
+        SourceItem it;
+        it.sessionId = view->sessionId();
+        it.name    = view->deviceName();
+        it.ip      = view->clientIp();
+        it.backend = view->backend();
+        it.status  = view->isRunning() ? QStringLiteral("投屏中")
+                                       : QStringLiteral("连接中");
+        items.append(it);
+    }
+    return items;
+}
+
+QPixmap DesktopWindow::thumbnailFor(const QString &sessionId) const
+{
+    for (SessionView *view : m_views) {
+        if (view && view->sessionId() == sessionId)
+            return view->thumbnail();
+    }
+    return QPixmap();
+}
+
+int DesktopWindow::maxGrid() const
+{
+    // 软解码(avdec_*):CPU 解码, 4 格封顶;其余(硬解) 16 格
+    if (m_decoder.startsWith(QStringLiteral("avdec")))
+        return 4;
+    return 16;
+}
+
+void DesktopWindow::focusSession(const QString &sessionId)
+{
+    if (m_focusView) {
+        // 先退出独占全屏, 恢复多窗口布局
+        m_focusView->setFullscreenActive(false);
+        m_focusView = nullptr;
+    }
+    for (int i = 0; i < m_views.size(); ++i) {
+        if (m_views[i] && m_views[i]->sessionId() == sessionId) {
+            SessionView *v = m_views.takeAt(i);
+            m_views.prepend(v);   // 移到首位
+            relayout();
+            return;
+        }
+    }
+}
+
+/* ---- 网关回调(SDK 事件线程) ---- */
+
+void DesktopWindow::gatewayLogCallback(const char *message, void *userdata)
+{
+    auto *self = static_cast<DesktopWindow *>(userdata);
+    if (self && message)
+        qInfo() << "[gateway]" << message;
+}
+
+void DesktopWindow::gatewayClientConnectedCallback(mirror_session_t *session,
+                                                   const char *client_ip,
+                                                   void *userdata)
+{
+    auto *self = static_cast<DesktopWindow *>(userdata);
+    if (!self || !session)
+        return;
+    const QString ip = client_ip ? QString::fromUtf8(client_ip) : QString();
+    // 句柄此刻仍由 SDK 持有;若在视图创建前设备就断开, 句柄会失效,
+    // onGatewayClientConnected 里用 mirror_get_state 兜底判断。
+    QMetaObject::invokeMethod(self, [self, session, ip]() {
+        self->onGatewayClientConnected(session, ip);
+    }, Qt::QueuedConnection);
+}
+
+void DesktopWindow::gatewayClientDisconnectedCallback(mirror_session_t *session,
+                                                      const char *client_ip,
+                                                      void *userdata)
+{
+    auto *self = static_cast<DesktopWindow *>(userdata);
+    if (!self || !session)
+        return;
+
+    // 句柄在回调返回后即被 SDK 回收, 这里先同步取出视图(指针有效期内),
+    // 再排队到主线程做 UI 清理, 避免使用已释放的句柄。
+    SessionView *view = nullptr;
+    {
+        QMutexLocker locker(&self->m_gatewayMutex);
+        view = self->m_gatewayViews.value(session, nullptr);
+        self->m_gatewayViews.remove(session);
+    }
+    Q_UNUSED(client_ip)
+
+    if (view) {
+        QMetaObject::invokeMethod(view, [view]() {
+            view->detach();
+            emit view->sessionClosed(view->sessionId());
+        }, Qt::QueuedConnection);
+    }
+}
+
+// 来源手机信息就绪:事件线程回调 → 排队到主线程更新视图悬浮标签
+void DesktopWindow::gatewayClientInfoCallback(mirror_session_t *session,
+                                              const char *client_name,
+                                              const char *client_model,
+                                              void *userdata)
+{
+    auto *self = static_cast<DesktopWindow *>(userdata);
+    if (!self || !session)
+        return;
+    const QString name = QString::fromUtf8(client_name ? client_name : "");
+    const QString model = QString::fromUtf8(client_model ? client_model : "");
+    // 仅用句柄作 map 键查找, 不 deref; 视图若已移除则为空, 忽略即可
+    QMetaObject::invokeMethod(self, [self, session, name, model]() {
+        SessionView *view = nullptr;
+        {
+            QMutexLocker locker(&self->m_gatewayMutex);
+            view = self->m_gatewayViews.value(session, nullptr);
+        }
+        if (view)
+            view->setClientInfo(name, model);
+        emit self->sourcesChanged();   // 手机名就绪 → 刷新控制台列表
+    }, Qt::QueuedConnection);
+}
+
+// 实例实际视频解码器就绪:软/硬解能力 → 更新最大宫格并重排
+void DesktopWindow::gatewayDecoderCallback(mirror_session_t *session,
+                                           const char *decoder,
+                                           void *userdata)
+{
+    auto *self = static_cast<DesktopWindow *>(userdata);
+    if (!self)
+        return;
+    const QString dec = QString::fromUtf8(decoder ? decoder : "");
+    Q_UNUSED(session)
+    QMetaObject::invokeMethod(self, [self, dec]() {
+        if (self->m_decoder == dec)
+            return;
+        self->m_decoder = dec;
+        const int g = self->maxGrid();
+        emit self->statusMessage(QStringLiteral("视频解码器: %1(最大 %2 格)")
+                                     .arg(dec.isEmpty() ? QStringLiteral("未知") : dec)
+                                     .arg(g));
+        self->relayout();
+    }, Qt::QueuedConnection);
+}
+
+void DesktopWindow::onGatewayClientConnected(mirror_session_t *session, const QString &ip)
+{
+    if (!session)
+        return;
+    // 兜底:句柄已失效(设备在视图创建前断开)则忽略
+    if (mirror_get_state(session) == MIRROR_STATE_CLOSED)
+        return;
+
+    auto *view = new SessionView(ip,   // 初始显示来源 IP, 手机名随后由 clientInfo 回调更新
+                                 MIRROR_BACKEND_AIRPLAY, m_canvasInner);
+    connect(view, &SessionView::sessionClosed,
+            this, &DesktopWindow::onSessionClosed);
+    connect(view, &SessionView::fullscreenRequested,
+            this, &DesktopWindow::onViewFullscreen);
+
+    view->adoptGatewaySession(session, ip);
+    m_views.append(view);
+    {
+        QMutexLocker locker(&m_gatewayMutex);
+        m_gatewayViews.insert(session, view);
+    }
+    relayout();
+    emit statusMessage(QStringLiteral("设备 %1 已连入").arg(ip));
+    emit sourcesChanged();
+}
+
+void DesktopWindow::onGatewayClientDisconnected(mirror_session_t *session)
+{
+    Q_UNUSED(session)
+    // 视图清理已在 gatewayClientDisconnectedCallback 中排队执行
 }
 
 void DesktopWindow::onSessionClosed(const QString &sessionId)
 {
     for (int i = 0; i < m_views.size(); ++i) {
         if (m_views[i]->sessionId() == sessionId) {
-            const bool wasAir   = (m_views[i]->deviceName() == QStringLiteral("MirrorCenter"));
-            const bool wasMira  = (m_views[i]->deviceName() == QStringLiteral("MirrorCenter-Miracast"));
+            const bool wasMira = (m_views[i]->deviceName() == QStringLiteral("MirrorCenter-Miracast"));
+            // 从网关视图表移除(若存在)
+            {
+                QMutexLocker locker(&m_gatewayMutex);
+                for (auto it = m_gatewayViews.begin(); it != m_gatewayViews.end(); ) {
+                    if (it.value() == m_views[i])
+                        it = m_gatewayViews.erase(it);
+                    else
+                        ++it;
+                }
+            }
+            const bool wasFocus = (m_focusView == m_views[i]);
             m_views[i]->deleteLater();
             m_views.removeAt(i);
-            if (wasAir)  m_airplayStarted  = false;
+            if (wasFocus)
+                m_focusView = nullptr;
             if (wasMira) m_miracastStarted = false;
             break;
         }
     }
     relayout();
+    emit sourcesChanged();
 }
 
 void DesktopWindow::toggleFullscreen()

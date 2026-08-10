@@ -54,6 +54,9 @@ public:
     /// Child window handle: HWND on Windows, X11 Window ID on Linux (0 = not ready)
     qulonglong windowHandle() const { return m_windowHandle; }
 
+    /// Child process id (0 = not started yet)
+    qint64 processId() const { return m_process ? m_process->processId() : 0; }
+
     /// Frame mode: enable FrameClient connecting to given address/port
     void setFrameMode(const QString &address, quint16 tcpPort);
 

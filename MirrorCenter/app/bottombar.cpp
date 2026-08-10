@@ -18,21 +18,6 @@ BottomControlBar::BottomControlBar(QWidget *parent)
     root->setContentsMargins(16, 10, 16, 10);
     root->setSpacing(16);
 
-    // 左侧折叠按钮
-    m_collapseBtn = new QToolButton(this);
-    m_collapseBtn->setObjectName("bottomCollapseBtn");
-    m_collapseBtn->setText(QStringLiteral("◀"));
-    m_collapseBtn->setToolTip(QStringLiteral("折叠/展开"));
-    m_collapseBtn->setCursor(Qt::PointingHandCursor);
-    m_collapseBtn->setFixedSize(28, 28);
-    connect(m_collapseBtn, &QToolButton::clicked, this, [this]() {
-        static bool collapsed = false;
-        collapsed = !collapsed;
-        m_collapseBtn->setText(collapsed ? QStringLiteral("▶") : QStringLiteral("◀"));
-        emit collapseToggled(collapsed);
-    });
-    root->addWidget(m_collapseBtn, 0, Qt::AlignBottom);
-
     // 左侧:系统状态
     m_status = new SystemStatus(this);
     root->addWidget(m_status, 0, Qt::AlignBottom);

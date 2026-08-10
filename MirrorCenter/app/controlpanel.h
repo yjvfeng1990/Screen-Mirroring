@@ -2,85 +2,93 @@
 
 #include <QWidget>
 #include <QString>
-#include <QPoint>
 #include <QList>
+#include <QHash>
+#include <QPointer>
+#include <functional>
 
-#include "sidebar.h"
-
-class TopBar;
-class BottomControlBar;
 class QVBoxLayout;
-class QHBoxLayout;
 class QToolButton;
 class QFrame;
+class QLabel;
+class QTimer;
+class QPixmap;
 
 /**
- * 悬浮控制台(无边框 + 置顶 + 可拖动)
- * - 内部三区:Sidebar(左) / TopBar(上) / BottomControlBar(下)
- * - 整体由一张半透明深色圆角面板承载,玻璃拟态感
- * - 标题栏可拖动整个面板
- * - 右上角"×"按钮 = 隐藏(DesktopWindow 上会浮现"显示控制台"小按钮)
- *
- * 信号:把所有操作转发给 DesktopWindow
+ * 侧边吸附"投屏来源/播放器窗口"面板(参考 TopDesk 侧边栏交互)
+ * - 停靠在屏幕右边缘, 平时收起只露出 8px 边缘触发条
+ * - 鼠标悬停触发条或面板 → 展开; 鼠标离开面板 300ms → 自动收起
+ * - 内容: 播放器窗口列表(缩略图 + 名称/IP/状态), 点击选中 → 该窗口在主窗口首位
+ * - 标题栏"×" = 收起到边缘(触发条可再次展开)
  */
 class ControlPanel : public QWidget
 {
     Q_OBJECT
 public:
+    /** 单个来源条目(播放器窗口) */
+    struct SourceInfo {
+        QString sessionId;  // 会话标识(选中置顶/缩略图定位用)
+        QString name;       // 来源名称(手机名或 IP)
+        QString ip;         // 客户端 IP
+        QString status;     // 状态文本
+    };
+
     explicit ControlPanel(QWidget *parent = nullptr);
     ~ControlPanel() override;
 
-    /** 构建导航分组(转给 Sidebar) */
-    void setNavGroups(const QList<Sidebar::NavGroup> &groups);
-    void selectNavKey(const QString &key);
+    /** 刷新来源列表(重建卡片;已有卡片保留以便平滑更新缩略图) */
+    void setSources(const QList<SourceInfo> &sources);
 
-    /** 同步当前布局模式到内部 TopBar/BottomBar */
-    void setLayoutMode(int mode);
-    int  layoutMode() const;
+    /** 设置缩略图获取函数(由 main 提供, 查 DesktopWindow) */
+    void setThumbnailProvider(std::function<QPixmap(const QString &)> provider);
 
-    /** 显示/隐藏动画(简单) */
+    /** 展开/收起吸附面板 */
     void setPanelVisible(bool show);
-    bool isPanelVisible() const { return !isHidden(); }
+    bool isPanelVisible() const;
 
 protected:
-    void mousePressEvent(QMouseEvent *e) override;
-    void mouseMoveEvent(QMouseEvent *e) override;
-    void mouseReleaseEvent(QMouseEvent *e) override;
-    void mouseDoubleClickEvent(QMouseEvent *e) override;
+    void enterEvent(QEnterEvent *event) override;
+    void leaveEvent(QEvent *event) override;
+    bool eventFilter(QObject *obj, QEvent *event) override;
 
 private:
     void buildUi();
     void buildTitleBar();
-    void wireSignals();
-    void applyLayout();
+    void expand();
+    void collapse();
+    void updateDockGeometry();
+    void updateTriggerPosition();
+    /** 刷新所有卡片缩略图(节拍触发) */
+    void refreshThumbnails();
+    /** 列表项被点击(选中置顶) */
+    void onItemClicked(const QString &sessionId);
+    /** 刷新选中高亮 */
+    void updateSelection();
 
-    QFrame         *m_rootFrame     = nullptr;  // 外层圆角面板
-    QFrame         *m_titleBar      = nullptr;  // 标题栏(可拖动)
-    QToolButton    *m_btnClose      = nullptr;  // 隐藏按钮
-    QToolButton    *m_btnPin        = nullptr;  // 置顶切换
-    QLabel         *m_titleLabel    = nullptr;
-    Sidebar        *m_sidebar       = nullptr;
-    TopBar         *m_topBar        = nullptr;
-    BottomControlBar *m_bottomBar   = nullptr;
-    int             m_currentMode   = 1;
-    bool            m_dragging      = false;
-    QPoint          m_dragOffset;
+    QFrame       *m_rootFrame    = nullptr;  // 外层圆角面板
+    QFrame       *m_titleBar     = nullptr;  // 标题栏
+    QToolButton  *m_btnClose     = nullptr;  // 收起到边缘
+    QLabel       *m_titleLabel   = nullptr;
+    QWidget      *m_listHost     = nullptr;  // 来源列表容器
+    QVBoxLayout  *m_listLayout   = nullptr;
+    QLabel       *m_emptyLabel   = nullptr;  // 空状态提示
+
+    // 列表卡片:sessionId → 缩略图标签
+    QHash<QString, QPointer<QLabel>> m_thumbLabels;
+    QString m_selectedId;                      // 当前选中(置顶)的会话
+    std::function<QPixmap(const QString &)> m_thumbProvider;
+    QTimer *m_thumbTimer = nullptr;            // 缩略图刷新节拍(800ms)
+
+    // 侧边吸附
+    QWidget *m_triggerButton = nullptr;   // 收起时屏幕右边缘的触发条(独立置顶小窗)
+    QTimer  *m_hideTimer     = nullptr;   // 鼠标离开 300ms 后收起
+    bool     m_dockedExpanded = true;     // 当前是否展开
+    int      m_panelWidth     = 320;
+    int      m_collapsedWidth = 8;
 
 signals:
-    /** 导航项被点击 */
-    void navItemClicked(const QString &key);
-    /** 布局模式改变 1/2/3/4/6/99 */
-    void layoutModeChanged(int mode);
-    /** 用户请求关闭(隐藏)控制台 */
+    /** 用户请求收起控制台 */
     void hideRequested();
-    /** 全屏切换请求 */
-    void fullscreenToggleRequested();
-    /** 投屏帮助 */
-    void helpRequested();
-    /** 录屏 / 录制 / 更多 等操作 */
-    void recordScreenRequested();
-    void recordRequested();
-    void moreRequested();
-    /** 折叠底部 */
-    void bottomCollapseToggled(bool collapsed);
+    /** 用户点击列表项:选中该来源窗口, 由 DesktopWindow 置顶 */
+    void sourceSelected(const QString &sessionId);
 };

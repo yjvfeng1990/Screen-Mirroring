@@ -1,11 +1,18 @@
 #include "sessionview.h"
+#include "audiocontrol.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include <QLabel>
+#include <QToolButton>
 #include <QWindow>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QUuid>
 #include <QDebug>
+#include <QDateTime>
 #include <QMetaObject>
 #include <QPixmap>
 
@@ -16,46 +23,42 @@ SessionView::SessionView(const QString &deviceName, mirror_backend_t backend, QW
 {
     m_sessionId = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
-    auto *layout = new QVBoxLayout(this);
+    buildUi();
+
+    // 缩略图节拍:画面有变化时 1.2s 抓一次, 静止时 3s(去重, 不一直切图)
+    m_thumbTimer.setInterval(1200);
+    connect(&m_thumbTimer, &QTimer::timeout, this, [this]() {
+        const QImage img = captureThumbnail();
+        if (img.isNull())
+            return;
+        if (thumbChanged(img)) {
+            m_lastThumb = QPixmap::fromImage(img);
+            m_thumbTimer.setInterval(1200);
+            emit thumbnailUpdated();
+        } else {
+            // 画面无变化:延长抓取间隔, 降低 CPU/GDI 开销
+            m_thumbTimer.setInterval(3000);
+        }
+    });
+
+    // Miracast 仍走"自建会话"流程;AirPlay 由网关回调 adoptGatewaySession 包装
+    if (m_backend == MIRROR_BACKEND_MIRACAST)
+        startStandaloneSession();
+}
+
+void SessionView::buildUi()
+{
+    // 无边框、视频铺满整格;设备信息以半透明悬浮标签叠加在画面左上角
+    auto *layout = new QGridLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
     setObjectName("sessionCard");
 
-    // 顶栏:设备名 + 状态指示点 + 状态文字
-    m_topBar = new QWidget(this);
-    m_topBar->setObjectName("sessionTopBar");
-    auto *barLayout = new QHBoxLayout(m_topBar);
-    barLayout->setContentsMargins(14, 8, 14, 8);
-    barLayout->setSpacing(8);
+    // 视频区:占位 → 嵌入窗口 / Miracast 帧
+    m_videoArea = new QWidget(this);
+    auto *phLayout = new QVBoxLayout(m_videoArea);
+    phLayout->setContentsMargins(0, 0, 0, 0);
 
-    // 设备名前面:小图标(根据后端区分)
-    QString prefixIcon = (m_backend == MIRROR_BACKEND_AIRPLAY)
-                            ? QStringLiteral("🍎")
-                            : QStringLiteral("📡");
-    auto *prefixLabel = new QLabel(prefixIcon, m_topBar);
-    prefixLabel->setStyleSheet(
-        "background-color:transparent; font-size:14px;");
-    barLayout->addWidget(prefixLabel);
-
-    auto *nameLabel = new QLabel(m_deviceName, m_topBar);
-    nameLabel->setObjectName("sessionTitle");
-    barLayout->addWidget(nameLabel);
-    barLayout->addStretch();
-
-    // 状态指示点(● 灰 / 绿)
-    m_statusDot = new QLabel(QStringLiteral("●"), m_topBar);
-    m_statusDot->setStyleSheet(
-        "color:#6B7488; font-size:10px; background-color:transparent;");
-    barLayout->addWidget(m_statusDot);
-
-    m_statusLabel = new QLabel(QStringLiteral("启动中..."), m_topBar);
-    m_statusLabel->setObjectName("sessionStatus");
-    barLayout->addWidget(m_statusLabel);
-    layout->addWidget(m_topBar);
-
-    // 占位区:AirPlay 拿到句柄后替换为嵌入窗口;Miracast 为帧显示区
-    m_placeholder = new QWidget(this);
-    auto *phLayout = new QVBoxLayout(m_placeholder);
     QString placeholderText;
     if (m_backend == MIRROR_BACKEND_AIRPLAY) {
         placeholderText = QStringLiteral(
@@ -73,24 +76,78 @@ SessionView::SessionView(const QString &deviceName, mirror_backend_t backend, QW
             "③ 选择「%1」")
             .arg(m_deviceName);
     }
-    auto *phLabel = new QLabel(placeholderText, m_placeholder);
+    auto *phLabel = new QLabel(placeholderText, m_videoArea);
     phLabel->setAlignment(Qt::AlignCenter);
     phLabel->setObjectName("placeholderText");
     phLayout->addWidget(phLabel);
-    layout->addWidget(m_placeholder, 1);
+    layout->addWidget(m_videoArea, 0, 0);
 
     if (m_backend == MIRROR_BACKEND_MIRACAST) {
-        // Miracast 帧模式:用 QLabel 显示最新帧
+        // Miracast 帧模式:用 QLabel 显示最新帧(铺满整格)
         m_videoLabel = new QLabel(this);
         m_videoLabel->setAlignment(Qt::AlignCenter);
-        m_videoLabel->setMinimumSize(320, 200);
         m_videoLabel->setScaledContents(false);
-        layout->replaceWidget(m_placeholder, m_videoLabel);
-        m_placeholder->deleteLater();
-        m_placeholder = nullptr;
-        m_videoLabel->show();
+        layout->removeWidget(m_videoArea);
+        m_videoArea->deleteLater();
+        m_videoArea = nullptr;
+        layout->addWidget(m_videoLabel, 0, 0);
     }
 
+    // 悬浮信息标签:独立顶层无边框小窗, 悬浮在画面左上角。
+    // 必须用顶层窗: 嵌入的 D3D11 视频是原生 HWND, 会盖住普通 Qt 子控件。
+    m_infoBadge = new QWidget;
+    m_infoBadge->setWindowFlags(Qt::FramelessWindowHint | Qt::Tool
+                                | Qt::WindowStaysOnTopHint | Qt::BypassWindowManagerHint);
+    m_infoBadge->setAttribute(Qt::WA_ShowWithoutActivating);
+    m_infoBadge->setStyleSheet(
+        "QWidget#infoBadge {"
+        "  color:#FFFFFF; font-size:12px; font-weight:600;"
+        "  background-color:rgba(10, 14, 24, 180);"
+        "  border-radius:14px;"
+        "}");
+    m_infoBadge->setObjectName("infoBadge");
+
+    m_statusDot = new QLabel(QStringLiteral("●"), m_infoBadge);
+    m_statusDot->setStyleSheet("color:#6B7488; font-size:10px;"
+                               "background-color:transparent;");
+    m_statusLabel = new QLabel(QStringLiteral("启动中..."), m_infoBadge);
+    m_statusLabel->setStyleSheet("background-color:transparent;");
+
+    m_devLabel = new QLabel(m_deviceName, m_infoBadge);
+    m_devLabel->setStyleSheet("background-color:transparent;");
+
+    auto *badgeL = new QHBoxLayout(m_infoBadge);
+    badgeL->setContentsMargins(12, 6, 8, 6);
+    badgeL->setSpacing(6);
+    badgeL->addWidget(m_devLabel);
+    badgeL->addWidget(m_statusDot);
+    badgeL->addWidget(m_statusLabel);
+
+    // 静音 / 全屏按钮
+    const QString btnQss =
+        "QToolButton { color:#C8D0DC; background:transparent; border:none;"
+        "              font-size:14px; padding:2px 4px; }"
+        "QToolButton:hover { color:#FFFFFF; }"
+        "QToolButton:pressed { color:#4ADE80; }";
+    m_muteBtn = new QToolButton(m_infoBadge);
+    m_muteBtn->setText(QStringLiteral("🔊"));
+    m_muteBtn->setToolTip(QStringLiteral("静音 / 取消静音"));
+    m_muteBtn->setCursor(Qt::PointingHandCursor);
+    m_muteBtn->setStyleSheet(btnQss);
+    connect(m_muteBtn, &QToolButton::clicked, this, &SessionView::toggleMute);
+    badgeL->addWidget(m_muteBtn);
+
+    m_fullBtn = new QToolButton(m_infoBadge);
+    m_fullBtn->setText(QStringLiteral("⛶"));
+    m_fullBtn->setToolTip(QStringLiteral("全屏 / 还原"));
+    m_fullBtn->setCursor(Qt::PointingHandCursor);
+    m_fullBtn->setStyleSheet(btnQss);
+    connect(m_fullBtn, &QToolButton::clicked, this, &SessionView::toggleFullscreen);
+    badgeL->addWidget(m_fullBtn);
+}
+
+void SessionView::startStandaloneSession()
+{
     // 通过 SDK 启动会话
     mirror_callbacks_t cbs;
     cbs.on_state  = &SessionView::onStateCallback;
@@ -119,18 +176,93 @@ SessionView::SessionView(const QString &deviceName, mirror_backend_t backend, QW
     m_running = true;
 }
 
+void SessionView::attachCallbacks()
+{
+    if (!m_sdkSession)
+        return;
+    mirror_callbacks_t cbs;
+    cbs.on_state  = &SessionView::onStateCallback;
+    cbs.on_window = &SessionView::onWindowCallback;
+    cbs.on_log    = &SessionView::onLogCallback;
+    cbs.on_frame  = &SessionView::onFrameCallback;
+    mirror_set_callbacks(m_sdkSession, &cbs, this);
+}
+
+void SessionView::adoptGatewaySession(mirror_session_t *sdkSession, const QString &clientIp)
+{
+    m_gatewayMode = true;
+    m_clientIp = clientIp;
+    m_sdkSession = sdkSession;
+    m_running = true;
+
+    attachCallbacks();
+    setStatus(QStringLiteral("已连接 %1").arg(clientIp));
+
+    // 网关的实例窗口在空闲时被隐藏, 且窗口可能早于连接就绪,
+    // 这里主动查询一次, 有窗口立即嵌入, 否则等 on_window 回调。
+    const uint64_t wid = mirror_get_window(sdkSession);
+    if (wid)
+        attachWindow(static_cast<qulonglong>(wid));
+}
+
 SessionView::~SessionView()
 {
     stop();
+    if (m_infoBadge) {
+        m_infoBadge->hide();
+        m_infoBadge->deleteLater();
+        m_infoBadge = nullptr;
+    }
 }
 
 void SessionView::stop()
 {
-    if (m_sdkSession) {
+    m_thumbTimer.stop();
+    m_lastThumb = QPixmap();
+    m_thumbFp = QImage();
+    m_hasThumbFp = false;
+    if (m_gatewayMode) {
+        // 网关模式:句柄由网关/设备生命周期管理, 只解除回调与嵌入
+        if (m_sdkSession)
+            mirror_set_callbacks(m_sdkSession, nullptr, nullptr);
+        m_sdkSession = nullptr;
+    } else if (m_sdkSession) {
         mirror_destroy_session(m_sdkSession);
         m_sdkSession = nullptr;
     }
     m_running = false;
+}
+
+void SessionView::detach()
+{
+    // 移除嵌入的视频窗口容器(视图随后由 DesktopWindow 删除)
+    m_thumbTimer.stop();
+    m_lastThumb = QPixmap();
+    m_thumbFp = QImage();
+    m_hasThumbFp = false;
+    auto *layout = qobject_cast<QGridLayout *>(this->layout());
+    if (layout && m_childWindow) {
+        for (int i = layout->count() - 1; i >= 0; --i) {
+            QLayoutItem *item = layout->itemAt(i);
+            QWidget *w = item ? item->widget() : nullptr;
+            if (w && w != m_infoBadge && w != m_videoArea) {
+                layout->removeWidget(w);
+                w->setParent(nullptr);
+                w->deleteLater();
+            }
+        }
+        m_childWindow = nullptr;
+    }
+    // 恢复占位提示区
+    if (m_videoArea && m_videoArea->parent() != this) {
+        if (auto *g = qobject_cast<QGridLayout *>(this->layout()))
+            g->addWidget(m_videoArea, 0, 0);
+        m_videoArea->show();
+    }
+    if (m_infoBadge)
+        m_infoBadge->hide();
+    m_running = false;
+    setStatus(QStringLiteral("已断开"));
 }
 
 /* ---- SDK 回调(C 层,事件线程触发) ---- */
@@ -185,6 +317,98 @@ void SessionView::onFrameCallback(mirror_session_t *session, void *userdata)
 
 /* ---- UI 层 ---- */
 
+QPixmap SessionView::thumbnail() const
+{
+    return m_lastThumb;
+}
+
+QImage SessionView::captureThumbnail()
+{
+#ifdef _WIN32
+    // AirPlay:抓取嵌入的 D3D11 原生窗口画面
+    if (m_backend == MIRROR_BACKEND_AIRPLAY && m_childWindow) {
+        HWND hwnd = reinterpret_cast<HWND>(m_childWindow->winId());
+        if (!hwnd || !::IsWindow(hwnd))
+            return QImage();
+
+        RECT rc;
+        if (!::GetClientRect(hwnd, &rc))
+            return QImage();
+        const int w = rc.right - rc.left;
+        const int h = rc.bottom - rc.top;
+        if (w <= 0 || h <= 0)
+            return QImage();
+
+        HDC winDc = ::GetDC(hwnd);
+        if (!winDc)
+            return QImage();
+        HDC memDc = ::CreateCompatibleDC(winDc);
+        HBITMAP bmp = ::CreateCompatibleBitmap(winDc, w, h);
+        HGDIOBJ old = ::SelectObject(memDc, bmp);
+
+        // PW_RENDERFULLCONTENT:抓取 D3D11 实际渲染内容(而非窗口表面)
+        BOOL ok = ::PrintWindow(hwnd, memDc, PW_RENDERFULLCONTENT);
+        if (!ok)   // 回退普通 BitBlt
+            ok = ::BitBlt(memDc, 0, 0, w, h, winDc, 0, 0, SRCCOPY);
+
+        ::SelectObject(memDc, old);
+
+        QImage img;
+        if (ok) {
+            BITMAPINFO bmi{};
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h;   // top-down
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            img = QImage(w, h, QImage::Format_ARGB32_Premultiplied);
+            if (::GetDIBits(memDc, bmp, 0, h, img.bits(), &bmi, DIB_RGB_COLORS) == 0)
+                img = QImage();
+        }
+        ::DeleteObject(bmp);
+        ::DeleteDC(memDc);
+        ::ReleaseDC(hwnd, winDc);
+        return img;
+    }
+#endif
+    // Miracast:帧模式,直接取最近显示的画面
+    if (m_videoLabel) {
+        QPixmap p = m_videoLabel->pixmap();
+        if (!p.isNull())
+            return p.toImage();
+    }
+    return QImage();
+}
+
+bool SessionView::thumbChanged(const QImage &thumb)
+{
+    // 缩成 16x9 指纹(忽略宽高比差异, 仅比较内容), 成本极低
+    const QImage fp = thumb.scaled(16, 9, Qt::IgnoreAspectRatio, Qt::FastTransformation);
+    if (!m_hasThumbFp || fp.size() != m_thumbFp.size()) {
+        m_thumbFp = fp;
+        m_hasThumbFp = true;
+        return true;
+    }
+    if (fp == m_thumbFp)   // QImage operator== 逐像素比较(16x9=144 像素)
+        return false;
+
+    // 统计差异像素比例, 超过 1% 视为画面有实际变化
+    int diff = 0;
+    const int total = fp.width() * fp.height();
+    for (int y = 0; y < fp.height(); ++y) {
+        for (int x = 0; x < fp.width(); ++x) {
+            const QRgb a = fp.pixel(x, y);
+            const QRgb b = m_thumbFp.pixel(x, y);
+            if (qAbs(qRed(a) - qRed(b)) + qAbs(qGreen(a) - qGreen(b))
+                + qAbs(qBlue(a) - qBlue(b)) > 24)
+                ++diff;
+        }
+    }
+    m_thumbFp = fp;
+    return (double(diff) / total) > 0.01;
+}
+
 void SessionView::renderFrame()
 {
     if (!m_sdkSession || !m_videoLabel)
@@ -204,12 +428,20 @@ void SessionView::renderFrame()
     m_videoLabel->setPixmap(QPixmap::fromImage(img).scaled(
         m_videoLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
     setStatus(QStringLiteral("接收中 %1x%2").arg(frame.width).arg(frame.height));
+    if (!m_thumbTimer.isActive())
+        m_thumbTimer.start();
 }
 
 void SessionView::attachWindow(qulonglong wid)
 {
-    if (!wid)
+    // 设备断开后 GStreamer 会销毁 d3d11 窗口, 重连/新设备可能拿到已失效句柄。
+    // 无效句柄直接忽略, 等 on_window 回调(新窗口就绪)再嵌入, 避免 Qt ASSERT 崩溃。
+    if (!wid || !::IsWindow(reinterpret_cast<HWND>(wid)))
         return;
+
+    qInfo().nospace() << "[view] attachWindow wid=" << wid
+        << " at " << QDateTime::currentDateTime().toString("HH:mm:ss.zzz")
+        << " session=" << m_sessionId;
 
     QWindow *native = QWindow::fromWinId(WId(wid));
     if (!native)
@@ -221,16 +453,102 @@ void SessionView::attachWindow(qulonglong wid)
     QWidget *container = QWidget::createWindowContainer(native, this);
     container->setFocusPolicy(Qt::StrongFocus);
 
-    auto *layout = qobject_cast<QVBoxLayout *>(this->layout());
-    if (layout && m_placeholder) {
-        layout->removeWidget(m_placeholder);
-        m_placeholder->deleteLater();
-        m_placeholder = nullptr;
+    if (auto *g = qobject_cast<QGridLayout *>(this->layout())) {
+        if (m_videoArea) {
+            g->removeWidget(m_videoArea);
+            m_videoArea->deleteLater();
+            m_videoArea = nullptr;
+        }
+        g->addWidget(container, 0, 0);
+        container->show();
     }
-    if (layout)
-        layout->addWidget(container, 1);
+    if (m_infoBadge)
+        m_infoBadge->raise();
 
     setStatus(QStringLiteral("已连接"));
+    if (!m_thumbTimer.isActive())
+        m_thumbTimer.start();
+}
+
+void SessionView::updateInfoBadge()
+{
+    if (!m_infoBadge)
+        return;
+    if (!isVisible()) {
+        m_infoBadge->hide();
+        return;
+    }
+    // 定位到本视图左上角(全局坐标), 悬浮在视频之上
+    m_infoBadge->move(mapToGlobal(QPoint(12, 12)));
+    m_infoBadge->show();
+}
+
+void SessionView::moveEvent(QMoveEvent *e)
+{
+    QWidget::moveEvent(e);
+    updateInfoBadge();
+}
+
+void SessionView::resizeEvent(QResizeEvent *e)
+{
+    QWidget::resizeEvent(e);
+    updateInfoBadge();
+}
+
+void SessionView::showEvent(QShowEvent *e)
+{
+    QWidget::showEvent(e);
+    updateInfoBadge();
+    // 视图重新可见且仍有画面:恢复缩略图抓取
+    if (m_running && m_sdkSession && !m_thumbTimer.isActive())
+        m_thumbTimer.start();
+}
+
+void SessionView::hideEvent(QHideEvent *e)
+{
+    QWidget::hideEvent(e);
+    if (m_infoBadge)
+        m_infoBadge->hide();
+    // 视图不可见(被覆盖/超限):暂停抓图, 省 CPU/GDI
+    m_thumbTimer.stop();
+}
+
+void SessionView::toggleMute()
+{
+    if (!m_sdkSession)
+        return;
+    const uint64_t pid = mirror_get_process_id(m_sdkSession);
+    if (!pid) {
+        setStatus(QStringLiteral("后端未就绪"));
+        return;
+    }
+    m_muted = !m_muted;
+    if (!mirrorui::setProcessAudioMute(pid, m_muted)) {
+        m_muted = !m_muted;   // 未找到音频会话, 回滚
+        setStatus(QStringLiteral("静音控制失败"));
+        return;
+    }
+    if (m_muteBtn)
+        m_muteBtn->setText(m_muted ? QStringLiteral("🔇") : QStringLiteral("🔊"));
+    setStatus(m_muted ? QStringLiteral("已静音") : QStringLiteral("已取消静音"));
+}
+
+void SessionView::toggleFullscreen()
+{
+    emit fullscreenRequested(m_sessionId);
+}
+
+void SessionView::setFullscreenActive(bool active)
+{
+    if (m_fullBtn)
+        m_fullBtn->setText(active ? QStringLiteral("❐") : QStringLiteral("⛶"));
+}
+
+void SessionView::setClientInfo(const QString &name, const QString &model)
+{
+    Q_UNUSED(model)   // 只显示设备名称
+    if (!name.isEmpty() && m_devLabel)
+        m_devLabel->setText(name);
 }
 
 void SessionView::setStatus(const QString &s)

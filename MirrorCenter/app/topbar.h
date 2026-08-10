@@ -10,7 +10,7 @@ class QLabel;
 /**
  * 顶部栏(EdgeCast Studio 风格)
  * - 居中:布局选择器(胶囊下拉)
- * - 右侧:全屏 / 录屏 / 录制 / 投屏帮助 / 更多
+ * - 右侧:全屏按钮
  */
 class TopBar : public QWidget
 {
@@ -29,20 +29,8 @@ signals:
     void layoutOptionChanged(const QString &text);
     /** 全屏 */
     void fullscreenClicked();
-    /** 录屏(投屏画面录制) */
-    void recordScreenClicked();
-    /** 录制(单独录制按钮) */
-    void recordClicked();
-    /** 投屏帮助 */
-    void helpClicked();
-    /** 更多 */
-    void moreClicked();
 
 private:
     QComboBox   *m_layoutCombo = nullptr;
     QToolButton *m_btnFullscreen = nullptr;
-    QToolButton *m_btnRecordScreen = nullptr;
-    QToolButton *m_btnRecord = nullptr;
-    QToolButton *m_btnHelp = nullptr;
-    QToolButton *m_btnMore = nullptr;
 };

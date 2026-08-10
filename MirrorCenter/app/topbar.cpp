@@ -55,45 +55,29 @@ TopBar::TopBar(QWidget *parent)
     midSpacer->setMinimumWidth(40);
     root->addWidget(midSpacer);
 
-    // -------- 右侧:5 个操作按钮 --------
+    // -------- 右侧:全屏按钮 --------
     auto *rightWrap = new QWidget(this);
     rightWrap->setObjectName("topBarRight");
     auto *rl = new QHBoxLayout(rightWrap);
     rl->setContentsMargins(0, 0, 0, 0);
     rl->setSpacing(6);
 
-    struct ActionDef { QToolButton **btn; QString icon; QString text; };
-    const ActionDef defs[] = {
-        { &m_btnFullscreen,  QStringLiteral("⛶"), QStringLiteral("全屏")   },
-        { &m_btnRecordScreen,QStringLiteral("⏺"), QStringLiteral("录屏")   },
-        { &m_btnRecord,      QStringLiteral("●"), QStringLiteral("录制")   },
-        { &m_btnHelp,        QStringLiteral("?"), QStringLiteral("投屏帮助") },
-        { &m_btnMore,        QStringLiteral("⋯"), QStringLiteral("更多")   },
-    };
-    for (const ActionDef &d : defs) {
-        auto *btn = new QToolButton(rightWrap);
-        btn->setObjectName("topActionButton");
-        // 图标 + 文字两行排列(模仿参考图)
-        btn->setText(QStringLiteral("%1\n%2").arg(d.icon, d.text));
-        btn->setToolButtonStyle(Qt::ToolButtonTextOnly);
-        btn->setToolTip(d.text);
-        btn->setCursor(Qt::PointingHandCursor);
-        btn->setMinimumWidth(56);
-        btn->setMinimumHeight(40);
-        *(d.btn) = btn;
-        rl->addWidget(btn);
-    }
+    m_btnFullscreen = new QToolButton(rightWrap);
+    m_btnFullscreen->setObjectName("topActionButton");
+    m_btnFullscreen->setText(QStringLiteral("⛶\n全屏"));
+    m_btnFullscreen->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    m_btnFullscreen->setToolTip(QStringLiteral("全屏"));
+    m_btnFullscreen->setCursor(Qt::PointingHandCursor);
+    m_btnFullscreen->setMinimumWidth(56);
+    m_btnFullscreen->setMinimumHeight(40);
+    rl->addWidget(m_btnFullscreen);
 
     root->addWidget(rightWrap);
 
     // 信号
     connect(m_layoutCombo, &QComboBox::currentTextChanged,
             this, &TopBar::layoutOptionChanged);
-    connect(m_btnFullscreen,   &QToolButton::clicked, this, &TopBar::fullscreenClicked);
-    connect(m_btnRecordScreen, &QToolButton::clicked, this, &TopBar::recordScreenClicked);
-    connect(m_btnRecord,       &QToolButton::clicked, this, &TopBar::recordClicked);
-    connect(m_btnHelp,         &QToolButton::clicked, this, &TopBar::helpClicked);
-    connect(m_btnMore,         &QToolButton::clicked, this, &TopBar::moreClicked);
+    connect(m_btnFullscreen, &QToolButton::clicked, this, &TopBar::fullscreenClicked);
 }
 
 void TopBar::setLayoutOptions(const QStringList &options, int currentIndex)

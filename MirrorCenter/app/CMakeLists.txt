@@ -17,6 +17,8 @@ qt_add_executable(MirrorCenter WIN32
     systemstatus.h
     volumecontrol.cpp
     volumecontrol.h
+    audiocontrol.cpp
+    audiocontrol.h
     resources.qrc
 )
 

@@ -5,11 +5,9 @@
 #include <QDateTime>
 #include <QMessageLogContext>
 #include <QTimer>
-#include <QScreen>
 #include <QToolButton>
 #include "desktopwindow.h"
 #include "controlpanel.h"
-#include "sidebar.h"
 #include "mirror_api.h"
 
 static void logToFile(QtMsgType type, const QMessageLogContext &, const QString &msg)
@@ -48,108 +46,53 @@ int main(int argc, char *argv[])
     DesktopWindow desktop;
     desktop.show();
 
-    // ============ 2) 悬浮控制台 ============
+    // ============ 2) 侧边吸附"投屏来源"面板 ============
     ControlPanel panel;
-    QList<Sidebar::NavGroup> groups;
-    {
-        Sidebar::NavGroup g;
-        g.title = QStringLiteral("投屏控制");
-        g.items = {
-            { QStringLiteral("nav.layout"),     QStringLiteral("▦"), QStringLiteral("布局模式")   },
-            { QStringLiteral("nav.screens"),    QStringLiteral("▤"), QStringLiteral("画面管理")   },
-            { QStringLiteral("nav.scenes"),     QStringLiteral("◫"), QStringLiteral("场景管理")   },
-            { QStringLiteral("nav.presets"),    QStringLiteral("▢"), QStringLiteral("预设布局")   },
-        };
-        groups.append(g);
-    }
-    {
-        Sidebar::NavGroup g;
-        g.title = QStringLiteral("信号源");
-        g.items = {
-            { QStringLiteral("nav.src.airplay"),  QStringLiteral("🍎"), QStringLiteral("AirPlay 接收")   },
-            { QStringLiteral("nav.src.miracast"), QStringLiteral("📡"), QStringLiteral("Miracast 接收") },
-            { QStringLiteral("nav.src.devices"),  QStringLiteral("📱"), QStringLiteral("投屏设备列表") },
-            { QStringLiteral("nav.src.stream"),   QStringLiteral("🌐"), QStringLiteral("网络流媒体")   },
-        };
-        groups.append(g);
-    }
-    {
-        Sidebar::NavGroup g;
-        g.title = QStringLiteral("系统工具");
-        g.items = {
-            { QStringLiteral("nav.sys.audio"),    QStringLiteral("🔊"), QStringLiteral("音频控制")   },
-            { QStringLiteral("nav.sys.settings"), QStringLiteral("⚙"),  QStringLiteral("系统设置")   },
-            { QStringLiteral("nav.sys.network"),  QStringLiteral("📶"), QStringLiteral("网络设置")   },
-            { QStringLiteral("nav.sys.devices"),  QStringLiteral("🖥"), QStringLiteral("设备管理")   },
-            { QStringLiteral("nav.sys.log"),      QStringLiteral("📋"), QStringLiteral("日志中心")   },
-        };
-        groups.append(g);
-    }
-    panel.setNavGroups(groups);
-    panel.selectNavKey("nav.layout");
-    panel.setLayoutMode(1);
-
-    // 默认位置:屏幕右侧居中
-    {
-        const QRect screen = QApplication::primaryScreen()->availableGeometry();
-        const int x = screen.right() - panel.width() - 40;
-        const int y = screen.center().y() - panel.height() / 2;
-        panel.move(x, y);
-    }
+    // 面板吸附在屏幕右边缘, 由面板内部定位; 初始展开显示
     panel.show();
 
     // ============ 3) 信号连接 ============
-    // 布局模式变更
-    QObject::connect(&panel, &ControlPanel::layoutModeChanged,
-                     &desktop, &DesktopWindow::setLayoutMode);
-    // 关闭按钮
+    // 来源列表刷新:桌面会话增删/设备名就绪 → 拉取列表 → 更新面板
+    auto refreshSources = [&panel, &desktop]() {
+        QList<ControlPanel::SourceInfo> items;
+        for (const SourceItem &it : desktop.sourceItems()) {
+            ControlPanel::SourceInfo si;
+            si.sessionId = it.sessionId;
+            si.name   = it.name;
+            si.ip     = it.ip;
+            si.status = it.status;
+            items.append(si);
+        }
+        panel.setSources(items);
+    };
+    QObject::connect(&desktop, &DesktopWindow::sourcesChanged,
+                     &desktop, refreshSources);
+    refreshSources();   // 初始刷新(此时无设备, 显示空状态)
+
+    // 缩略图 provider:控制台定时向桌面窗口拉取各会话画面
+    panel.setThumbnailProvider([&desktop](const QString &sessionId) {
+        return desktop.thumbnailFor(sessionId);
+    });
+
+    // 列表点击选中 → 该来源窗口在主窗口首位
+    QObject::connect(&panel, &ControlPanel::sourceSelected,
+                     &desktop, &DesktopWindow::focusSession);
+
+    // "×" 收起面板 → 桌面右下角显示"显示控制台"小按钮
     QObject::connect(&panel, &ControlPanel::hideRequested,
                      [&desktop]() { desktop.showToggleCtrlBtn(true); });
-    // "显示控制台"小按钮
+    // "显示控制台"小按钮 → 重新展开面板
     QObject::connect(desktop.toggleCtrlButton(), &QToolButton::clicked,
                      [&panel, &desktop]() {
                          panel.setPanelVisible(true);
                          desktop.showToggleCtrlBtn(false);
                      });
-    // 全屏切换
-    QObject::connect(&panel, &ControlPanel::fullscreenToggleRequested,
-                     &desktop, &DesktopWindow::toggleFullscreen);
-    // 状态信息回显到面板标题栏(简单演示)
+    // 状态信息回显(调试用)
     QObject::connect(&desktop, &DesktopWindow::statusMessage,
-                     [&panel](const QString &msg) {
-                         qInfo() << "[status]" << msg;
-                     });
-    // 投屏帮助:暂时 = 重置布局到单屏
-    QObject::connect(&panel, &ControlPanel::helpRequested,
-                     [&panel, &desktop]() {
-                         panel.setLayoutMode(1);
-                     });
-    // 录屏 / 录制 / 更多:目前仅日志
-    QObject::connect(&panel, &ControlPanel::recordScreenRequested,
-                     []() { qInfo() << "[ui] 录屏按钮点击(后续接入 ffmpeg)"; });
-    QObject::connect(&panel, &ControlPanel::recordRequested,
-                     []() { qInfo() << "[ui] 录制按钮点击(后续接入 SDK)"; });
-    QObject::connect(&panel, &ControlPanel::moreRequested,
-                     []() { qInfo() << "[ui] 更多按钮点击(后续接入菜单)"; });
-    // 折叠底部
-    QObject::connect(&panel, &ControlPanel::bottomCollapseToggled,
-                     [](bool collapsed) { qInfo() << "[ui] 底部折叠:" << collapsed; });
+                     [](const QString &msg) { qInfo() << "[status]" << msg; });
 
-    // 导航点击:信号源 → AirPlay / Miracast 启动对应会话
-    QObject::connect(&panel, &ControlPanel::navItemClicked,
-                     [&desktop](const QString &key) {
-                         if (key == "nav.src.airplay") {
-                             QTimer::singleShot(0, &desktop, &DesktopWindow::startAirPlay);
-                         } else if (key == "nav.src.miracast") {
-                             QTimer::singleShot(0, &desktop, &DesktopWindow::startMiracast);
-                         } else {
-                             qInfo() << "[ui] nav:" << key;
-                         }
-                     });
-
-    // 启动后自动开启全部投屏服务
+    // 启动后自动开启 AirPlay 网关(多设备自动调度);
     QTimer::singleShot(200, &desktop, &DesktopWindow::startAirPlay);
-    QTimer::singleShot(400, &desktop, &DesktopWindow::startMiracast);
 
     qInfo() << "entering event loop";
     return app.exec();

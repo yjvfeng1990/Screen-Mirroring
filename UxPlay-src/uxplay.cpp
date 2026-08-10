@@ -96,6 +96,7 @@ static const char *appname = DEFAULT_NAME;
 static std::string server_name = appname;
 static bool server_name_is_utf8 = false;
 static dnssd_t *dnssd = NULL;
+static bool silent_mode = false;   /* silent: 只监听端口,不广播 mDNS(供网关调度多实例使用) */
 static raop_t *raop = NULL;
 static logger_t *render_logger = NULL;
 static bool audio_sync = false;
@@ -915,6 +916,8 @@ static void print_info (char *name) {
     printf("Options:\n");
     printf("-n name   Specify network name of the AirPlay server (UTF-8/ascii)\n");
     printf("-nh       Do not add \"@hostname\" at the end of AirPlay server name\n");
+    printf("-silent   Silent mode: listen only, do not advertise via mDNS\n");
+    printf("          (used by gateway/dispatcher with multiple instances)\n");
     printf("-h265     Support h265 (4K) video (with h265 versions of h264 plugins)\n");
     printf("-mp4 [fn] Record (non-HLS)audio/video to mp4 file \"fn.[n].[format].mp4\"\n");
     printf("          n=1,2,.. format = H264/5, ALAC/AAC. Default fn=\"recording\"\n");
@@ -1446,6 +1449,10 @@ static void parse_arguments (int argc, char *argv[]) {
             exit(1);
         } else if (arg == "-fs" ) {
             fullscreen = true;
+        } else if (arg == "-silent") {
+            /* 静默模式:只监听端口,不广播 mDNS。由外部网关调度器统一广播设备名,
+               多个静默实例各监听独立端口,实现"一个广播名 + 多实例内部调度"。 */
+            silent_mode = true;
         } else if (arg == "-FPSdata") {
             show_client_FPS_data = true;
         } else if (arg == "-reset") {
@@ -2276,6 +2283,12 @@ extern "C" void conn_reset (void *cls, int reason) {
 
 extern "C" void report_client_request(void *cls, char *deviceid, char * model, char *name, bool * admit) {
     LOGI("connection request from %s (%s) with deviceID = %s\n", name, model, deviceid);
+    /* 静默模式:把来源手机信息输出到 stdout,供外部网关调度器解析后显示 */
+    if (silent_mode) {
+        printf("MIRROR_CLIENT_NAME=%s\n", name ? name : "");
+        printf("MIRROR_CLIENT_MODEL=%s\n", model ? model : "");
+        fflush(stdout);
+    }
     if (restrict_clients) {
         *admit = check_client(deviceid);
         if (*admit == false) {
@@ -3252,10 +3265,19 @@ int main (int argc, char *argv[]) {
         LOGI("Bluetooth LE beacon-based service discovery is possible: PID data written to %s", ble_filename.c_str());
     }
     
-    if (register_dnssd()) {
+    if (!silent_mode && register_dnssd()) {
         stop_raop_server();
         stop_dnssd();
         cleanup();
+    }
+    if (silent_mode) {
+        /* 静默模式不广播 mDNS,由外部网关调度器统一广播设备名。
+           stdout 输出配对公钥(pk)与 RTSP 主端口,供网关解析后:
+           1) mDNS TXT 记录必须携带与实例一致的 pk,否则 FairPlay 配对失败;
+           2) 网关将客户端 TCP 连接透明转发到该 RTSP 端口。 */
+        printf("MIRROR_PK=%s\n", raop_get_pk_str(raop));
+        printf("MIRROR_RTSP_PORT=%u\n", raop_port);
+        fflush(stdout);
     }
     reconnect:
     compression_type = 0;

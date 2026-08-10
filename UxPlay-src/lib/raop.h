@@ -132,6 +132,7 @@ RAOP_API void raop_set_lang(raop_t *raop, const char *lang, const char *lang_sub
 RAOP_API void raop_set_udp_ports(raop_t *raop, unsigned short port[3]);
 RAOP_API void raop_set_tcp_ports(raop_t *raop, unsigned short port[2]);
 RAOP_API unsigned short raop_get_port(raop_t *raop);
+RAOP_API const char *raop_get_pk_str(raop_t *raop);
 RAOP_API void *raop_get_callback_cls(raop_t *raop);
 RAOP_API int raop_start_httpd(raop_t *raop, unsigned short *port);
 RAOP_API int raop_is_running(raop_t *raop);

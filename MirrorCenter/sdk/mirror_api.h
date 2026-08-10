@@ -91,6 +91,63 @@ typedef struct mirror_callbacks {
     mirror_frame_callback  on_frame;
 } mirror_callbacks_t;
 
+/* ---- 网关(单广播名 + 多静默实例调度) ---- */
+
+/* 网关日志。message 仅在本次回调内有效。 */
+typedef void (*mirror_gateway_log_callback)(const char *message,
+                                            void *userdata);
+
+/* 设备连入/断开。session 为对应会话句柄,可直接用于 mirror_set_callbacks /
+ * mirror_get_window 等查询;断开回调触发后该句柄随后失效,宿主应清理对应视图。 */
+typedef void (*mirror_gateway_client_callback)(mirror_session_t *session,
+                                               const char *client_ip,
+                                               void *userdata);
+
+/* 来源手机名称/型号就绪(客户端配对握手后上报, 可能晚于连入回调)。 */
+typedef void (*mirror_gateway_client_info_callback)(mirror_session_t *session,
+                                                    const char *client_name,
+                                                    const char *client_model,
+                                                    void *userdata);
+
+/* 实例实际视频解码器就绪(如 "avdec_h264" 软解 / "d3d11h264dec" 硬解)。
+ * 宿主可根据软/硬解能力决定最大同时投屏路数(软解 CPU 吃紧, 应减少路数)。 */
+typedef void (*mirror_gateway_decoder_callback)(mirror_session_t *session,
+                                                const char *decoder,
+                                                void *userdata);
+
+typedef struct mirror_gateway_callbacks {
+    mirror_gateway_log_callback    on_log;
+    mirror_gateway_client_callback on_client_connected;
+    mirror_gateway_client_callback on_client_disconnected;
+    /* 来源手机信息(名称/型号)就绪 */
+    mirror_gateway_client_info_callback on_client_info;
+    /* 实例实际视频解码器就绪(软/硬解判断) */
+    mirror_gateway_decoder_callback on_decoder;
+} mirror_gateway_callbacks_t;
+
+/*
+ * 启动 AirPlay 网关:
+ *   - 以唯一设备名(默认 MirrorCenter)广播 mDNS, 监听 gatewayPort=7100
+ *   - 新设备连入时按需启动静默 uxplay 实例(-silent), 透明转发 RTSP
+ *   - 设备断开后实例保留 30s, 期间同设备重连续用原实例
+ * @param device_name 广播设备名(可为 NULL, 默认 "MirrorCenter")
+ * @param exe_path    uxplay 可执行文件路径(可为 NULL, SDK 自动搜索)
+ * @param keyfile     共享配对密钥文件(可为 NULL, 默认应用目录 mirrorcenter.key)
+ * @param mac         固定 MAC(可为 NULL, 默认 6c:6c:1b:30:00:01)
+ * @param cbs         网关回调(可为 NULL)
+ * @param userdata    回调用户数据
+ */
+MIRROR_API mirror_result_t mirror_start_airplay_gateway(
+    const char *device_name,
+    const char *exe_path,
+    const char *keyfile,
+    const char *mac,
+    const mirror_gateway_callbacks_t *cbs,
+    void *userdata);
+
+/* 停止 AirPlay 网关,销毁所有实例。 */
+MIRROR_API mirror_result_t mirror_stop_airplay_gateway(void);
+
 /* ---- 生命周期 ---- */
 
 /* 初始化 SDK。可调用多次,幂等。返回 MIRROR_OK 或错误码。 */
@@ -132,6 +189,9 @@ MIRROR_API mirror_result_t mirror_destroy_session(mirror_session_t *session);
 
 /* 获取会话窗口句柄:Windows HWND / Linux X11 Window ID。未就绪返回 0。 */
 MIRROR_API uint64_t mirror_get_window(mirror_session_t *session);
+
+/* 获取后端子进程 PID(0 = 未启动)。可用于按会话控制音频(如静音)。 */
+MIRROR_API uint64_t mirror_get_process_id(mirror_session_t *session);
 
 /* 获取会话当前状态。 */
 MIRROR_API mirror_state_t mirror_get_state(mirror_session_t *session);

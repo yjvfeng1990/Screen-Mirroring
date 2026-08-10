@@ -587,6 +587,38 @@ QStatusBar::item {
     border-bottom-right-radius: 14px;
 }
 
+/* 播放器窗口列表卡片 */
+#srcItemCard {
+    background-color: rgba(22, 27, 44, 140);
+    border: 1px solid rgba(255, 255, 255, 8);
+    border-radius: 12px;
+}
+
+#srcItemCard:hover {
+    background-color: rgba(74, 108, 247, 0.12);
+    border-color: rgba(74, 108, 247, 90);
+}
+
+#srcItemCard[selected="true"] {
+    background-color: rgba(74, 108, 247, 0.18);
+    border: 1px solid #3B5BDB;
+}
+
+#srcItemCard[selected="true"] #srcItemName {
+    color: #FFFFFF;
+}
+
+#srcItemThumb {
+    background-color: #0B0F1A;
+    border-radius: 6px;
+}
+
+#ctrlPanelEmpty {
+    color: #6B7488;
+    font-size: 13px;
+    background-color: transparent;
+}
+
 /* 桌面上的"显示控制台"小按钮 */
 #toggleCtrlBtn {
     background-color: rgba(14, 19, 32, 220);

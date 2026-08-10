@@ -1,12 +1,15 @@
 #include "mirror_api.h"
 #include "sessionmanager.h"
 #include "mirrorsession.h"
+#include "airplaygateway.h"
 
 #include <QCoreApplication>
+#include <QDir>
 #include <QPointer>
 #include <QString>
 #include <QStringList>
 #include <QHash>
+#include <QSet>
 #include <QThread>
 #include <QMutex>
 #include <QMetaObject>
@@ -32,6 +35,7 @@ struct mirror_session {
     void *userdata = nullptr;
     bool valid = false;
     QImage frameCache;                 // 最近一帧缓存(data 指针指向它)
+    int airplayPortBase = 0;           // AirPlay 实例端口基址(0 = 未分配)
 };
 
 // 递归锁:mirror_start_session 等会持锁调用 registerHandle/isHandleValid 等辅助函数,
@@ -41,6 +45,12 @@ static SessionManager *g_manager = nullptr;   // 生命周期:随 SDK 事件线�
 static QHash<mirror_session_t *, mirror_session_t *> g_sessions; // 指针登记表(防野指针)
 static QThread *g_thread = nullptr;
 static bool g_initialized = false;
+
+/* ---- 网关(单广播名 + 多静默实例调度) ---- */
+static AirPlayGateway *g_gateway = nullptr;       // 生命周期:事件线程,由 mirror_stop_airplay_gateway 释放
+static mirror_gateway_callbacks_t g_gatewayCbs{};
+static void *g_gatewayUserdata = nullptr;
+static QSet<mirror_session_t *> g_gatewayHandles; // 网关创建的会话句柄(回收时统一释放)
 
 /* 错误说明(线程本地) */
 static thread_local char g_lastError[256];
@@ -134,6 +144,29 @@ static void invokeOnManager(F &&fn)
 
 /* ============ 会话表管理 ============ */
 
+// AirPlay 多实例端口分配:
+// UxPlay 默认端口组(TCP 7100/7000/7001 + UDP 7011/6001/6000)同一进程只占一组,
+// 多台苹果设备同时投屏需要每个会话启动独立的 uxplay 实例并分配互不冲突的端口组。
+// 每组端口取连续 3 个(base, base+1, base+2),TCP/UDP 共用,步进 100 错开。
+static constexpr int kAirplayPortBase = 7100;
+static constexpr int kAirplayPortStep = 100;
+static QSet<int> g_airplayPorts;          // 已分配端口组基址
+
+// 分配最小未占用端口组基址(7100, 7200, 7300...)
+static int allocAirplayPortBase()
+{
+    int base = kAirplayPortBase;
+    while (g_airplayPorts.contains(base))
+        base += kAirplayPortStep;
+    g_airplayPorts.insert(base);
+    return base;
+}
+
+static void freeAirplayPortBase(int base)
+{
+    g_airplayPorts.remove(base);
+}
+
 static bool registerHandle(mirror_session_t *h)
 {
     QMutexLocker lock(&g_mutex);
@@ -191,6 +224,137 @@ static void dispatchFrame(mirror_session_t *h)
 {
     if (h && h->cbs.on_frame)
         h->cbs.on_frame(h, h->userdata);
+}
+
+/* ============ 网关辅助 ============ */
+
+static mirror_session_t *findHandleForCore(MirrorSession *core)
+{
+    QMutexLocker lock(&g_mutex);
+    for (auto *h : g_sessions.keys()) {
+        if (h->core.data() == core)
+            return h;
+    }
+    return nullptr;
+}
+
+/*
+ * 连接网关信号 → SDK 会话句柄与宿主回调。
+ * 网关对象在事件线程,连接使用直接连接 → 回调均在事件线程触发,
+ * 宿主在回调里可安全调用 mirror_set_callbacks / mirror_get_window 等。
+ */
+static void connectGatewaySignals(AirPlayGateway *gw)
+{
+    // 设备连入:为后端会话创建 SDK 句柄并通知宿主
+    QObject::connect(gw, &AirPlayGateway::clientConnected, gw,
+                     [](const QString &ip, MirrorSession *session) {
+        if (!session)
+            return;
+        auto *handle = new mirror_session_t();
+        handle->core = session;
+        handle->valid = true;
+        if (!registerHandle(handle)) {
+            delete handle;
+            return;
+        }
+        {
+            QMutexLocker lock(&g_mutex);
+            g_gatewayHandles.insert(handle);
+        }
+        if (g_gatewayCbs.on_client_connected) {
+            const QByteArray ipUtf8 = ip.toUtf8();
+            g_gatewayCbs.on_client_connected(handle, ipUtf8.constData(),
+                                             g_gatewayUserdata);
+        }
+    });
+
+    // 设备断开:通知宿主,句柄随后失效
+    QObject::connect(gw, &AirPlayGateway::clientDisconnected, gw,
+                     [](const QString &ip, MirrorSession *session) {
+        mirror_session_t *handle = findHandleForCore(session);
+        if (!handle)
+            return;
+        if (g_gatewayCbs.on_client_disconnected) {
+            const QByteArray ipUtf8 = ip.toUtf8();
+            g_gatewayCbs.on_client_disconnected(handle, ipUtf8.constData(),
+                                                g_gatewayUserdata);
+        }
+        {
+            QMutexLocker lock(&g_mutex);
+            g_gatewayHandles.remove(handle);
+        }
+        unregisterHandle(handle);
+        handle->valid = false;
+        handle->core = nullptr;
+        delete handle;
+    });
+
+    QObject::connect(gw, &AirPlayGateway::clientInfoChanged, gw,
+                     [](MirrorSession *session, const QString &name, const QString &model) {
+        if (!g_gatewayCbs.on_client_info)
+            return;
+        mirror_session_t *handle = findHandleForCore(session);
+        if (!handle)
+            return;
+        const QByteArray nameUtf8 = name.toUtf8();
+        const QByteArray modelUtf8 = model.toUtf8();
+        g_gatewayCbs.on_client_info(handle, nameUtf8.constData(),
+                                    modelUtf8.constData(), g_gatewayUserdata);
+    });
+
+    // 实例实际视频解码器就绪(软/硬解判断)
+    QObject::connect(gw, &AirPlayGateway::decoderChanged, gw,
+                     [](MirrorSession *session, const QString &decoder) {
+        if (!g_gatewayCbs.on_decoder)
+            return;
+        mirror_session_t *handle = findHandleForCore(session);
+        if (!handle)
+            return;
+        const QByteArray decoderUtf8 = decoder.toUtf8();
+        g_gatewayCbs.on_decoder(handle, decoderUtf8.constData(), g_gatewayUserdata);
+    });
+
+    QObject::connect(gw, &AirPlayGateway::logMessage, gw,
+                     [](const QString &msg) {
+        if (g_gatewayCbs.on_log) {
+            const QByteArray utf8 = msg.toUtf8();
+            g_gatewayCbs.on_log(utf8.constData(), g_gatewayUserdata);
+        }
+    });
+}
+
+/*
+ * 停止网关并回收其会话句柄。可在持有 g_mutex 时调用(递归锁, 同线程安全)。
+ * 已连接设备的视图清理依赖 on_state CLOSED 回调(网关停止会逐个关闭实例)。
+ */
+static void stopGatewayAndCleanHandles()
+{
+    AirPlayGateway *gw = nullptr;
+    QList<mirror_session_t *> handles;
+    {
+        QMutexLocker lock(&g_mutex);
+        gw = g_gateway;
+        g_gateway = nullptr;
+        g_gatewayCbs = mirror_gateway_callbacks_t{};
+        g_gatewayUserdata = nullptr;
+        handles = g_gatewayHandles.values();
+        g_gatewayHandles.clear();
+    }
+
+    if (gw) {
+        invokeOnManager([gw]() {
+            gw->disconnect();
+            gw->stop();
+            gw->deleteLater();
+        });
+    }
+
+    for (mirror_session_t *h : handles) {
+        unregisterHandle(h);
+        h->valid = false;
+        h->core = nullptr;
+        delete h;
+    }
 }
 
 /* ============ SDK 实现 ============ */
@@ -284,11 +448,92 @@ MIRROR_API mirror_result_t mirror_init(void)
     return MIRROR_OK;
 }
 
+MIRROR_API mirror_result_t mirror_start_airplay_gateway(
+    const char *device_name,
+    const char *exe_path,
+    const char *keyfile,
+    const char *mac,
+    const mirror_gateway_callbacks_t *cbs,
+    void *userdata)
+{
+    {
+        QMutexLocker lock(&g_mutex);
+        if (!g_initialized)
+            return MIRROR_ERR_NOT_INITIALIZED;
+        if (g_gateway)
+            return MIRROR_OK;   // 已启动, 幂等
+    }
+
+    AirPlayGateway::Config cfg;
+    cfg.deviceName = (device_name && *device_name)
+                         ? QString::fromUtf8(device_name)
+                         : QStringLiteral("MirrorCenter");
+    cfg.keyfile = (keyfile && *keyfile)
+                      ? QString::fromUtf8(keyfile)
+                      : QDir(QCoreApplication::applicationDirPath())
+                            .filePath(QStringLiteral("mirrorcenter.key"));
+    cfg.mac = (mac && *mac) ? QString::fromUtf8(mac)
+                            : QStringLiteral("6c:6c:1b:30:00:01");
+    cfg.backendExe = (exe_path && *exe_path)
+                         ? QString::fromUtf8(exe_path)
+                         : g_manager->findBackendExe({QStringLiteral("uxplay.exe"),
+                                                      QStringLiteral("uxplay")});
+    // 与单会话模式一致:默认 d3d11videosink 输出(窗口嵌入依赖)
+    cfg.extraArgs << QStringLiteral("-vs") << QStringLiteral("d3d11videosink");
+
+    mirror_gateway_callbacks_t cbsCopy{};
+    if (cbs)
+        cbsCopy = *cbs;
+
+    // 先挂回调:让网关启动期间的早期日志也能到达宿主
+    {
+        QMutexLocker lock(&g_mutex);
+        g_gatewayCbs = cbsCopy;
+        g_gatewayUserdata = userdata;
+    }
+
+    AirPlayGateway *gw = nullptr;
+    invokeOnManager([&]() {
+        auto *g = new AirPlayGateway(cfg, g_manager);
+        connectGatewaySignals(g);
+        if (!g->start()) {
+            qWarning() << "[sdk] airplay gateway start failed";
+            delete g;
+            return;
+        }
+        gw = g;
+    });
+    if (!gw) {
+        QMutexLocker lock(&g_mutex);
+        g_gatewayCbs = mirror_gateway_callbacks_t{};
+        g_gatewayUserdata = nullptr;
+        setError("airplay gateway start failed");
+        return MIRROR_ERR_SESSION_FAILED;
+    }
+
+    {
+        QMutexLocker lock(&g_mutex);
+        g_gateway = gw;
+    }
+    setError("ok");
+    return MIRROR_OK;
+}
+
+MIRROR_API mirror_result_t mirror_stop_airplay_gateway(void)
+{
+    stopGatewayAndCleanHandles();
+    setError("ok");
+    return MIRROR_OK;
+}
+
 MIRROR_API void mirror_shutdown(void)
 {
     QMutexLocker lock(&g_mutex);
     if (!g_initialized)
         return;
+
+    // 先停网关(其实例会话句柄由网关持有, 需先回收)
+    stopGatewayAndCleanHandles();
 
     // 清理所有会话句柄(标记失效并停止)
     for (auto it = g_sessions.begin(); it != g_sessions.end(); ++it) {
@@ -300,6 +545,7 @@ MIRROR_API void mirror_shutdown(void)
         delete h;   // 释放宿主持有的句柄内存
     }
     g_sessions.clear();
+    g_airplayPorts.clear();   // 释放所有 AirPlay 端口组
 
     if (g_manager) {
         g_manager->stopAll();
@@ -381,6 +627,16 @@ MIRROR_API mirror_result_t mirror_start_session(mirror_backend_t backend,
     // 只有指定该 sink 时窗口嵌入才生效;若调用方显式传了 -vs 则尊重其选择。
     if (type == BackendType::AirPlay && !argList.contains(QStringLiteral("-vs"))) {
         argList << QStringLiteral("-vs") << QStringLiteral("d3d11videosink");
+    }
+
+    // AirPlay 多实例:每会话独立 uxplay 进程,分配独立端口组 + 随机 MAC。
+    // - 端口组(-p base):与其它会话错开,避免 TCP/UDP 端口冲突
+    // - 随机 MAC(-m):不同实例使用不同 MAC,避免 AirPlay 配对/设备标识互相覆盖
+    if (type == BackendType::AirPlay) {
+        const int base = allocAirplayPortBase();
+        handle->airplayPortBase = base;
+        argList << QStringLiteral("-p") << QString::number(base)
+                << QStringLiteral("-m");
     }
 
 #ifdef _WIN32
@@ -498,6 +754,10 @@ MIRROR_API mirror_result_t mirror_destroy_session(mirror_session_t *session)
 
     unregisterHandle(session);
     session->valid = false;
+    if (session->airplayPortBase != 0) {
+        freeAirplayPortBase(session->airplayPortBase);
+        session->airplayPortBase = 0;
+    }
     delete session;
     return MIRROR_OK;
 }
@@ -507,6 +767,13 @@ MIRROR_API uint64_t mirror_get_window(mirror_session_t *session)
     if (!session || !isHandleValid(session) || !session->core)
         return 0;
     return static_cast<uint64_t>(session->core->windowHandle());
+}
+
+MIRROR_API uint64_t mirror_get_process_id(mirror_session_t *session)
+{
+    if (!session || !isHandleValid(session) || !session->core)
+        return 0;
+    return static_cast<uint64_t>(session->core->processId());
 }
 
 MIRROR_API mirror_state_t mirror_get_state(mirror_session_t *session)

@@ -6,6 +6,10 @@ add_library(mirrorcore STATIC
     sessionmanager.h
     frameclient.cpp
     frameclient.h
+    airplaygateway.cpp
+    airplaygateway.h
+    mdnsbroadcast.cpp
+    mdnsbroadcast.h
 )
 
 target_include_directories(mirrorcore PUBLIC
