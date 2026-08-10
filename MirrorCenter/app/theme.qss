@@ -1,0 +1,632 @@
+/* MirrorCenter 深色专业主题
+ * 风格:深蓝黑背景 + 蓝紫渐变高亮 + 玻璃拟态卡片 + 大圆角
+ * 灵感:EdgeCast Studio 多端投屏控制台
+ */
+
+* {
+    font-family: "Microsoft YaHei UI", "Noto Sans CJK SC", "PingFang SC", sans-serif;
+    color: #E6EAF2;
+}
+
+/* ============ 全局根容器 ============ */
+QMainWindow,
+#rootContainer,
+#centerCanvas,
+#sidebarRoot,
+#topBarRoot,
+#bottomBarRoot {
+    background-color: #0B0F1A;
+}
+
+QMainWindow {
+    background-color: #0B0F1A;
+}
+
+/* ============ 侧边栏 ============ */
+#sidebarRoot {
+    background-color: #0E1320;
+    border-right: 1px solid rgba(255, 255, 255, 6);
+}
+
+#sidebarHeader {
+    background-color: transparent;
+    border-bottom: 1px solid rgba(255, 255, 255, 6);
+}
+
+#sidebarLogo {
+    color: #FFFFFF;
+    font-size: 16px;
+    font-weight: 700;
+    background-color: transparent;
+    padding: 0;
+}
+
+#sidebarTagline {
+    color: #6B7488;
+    font-size: 11px;
+    background-color: transparent;
+    padding: 0;
+}
+
+#sidebarScroll {
+    background-color: transparent;
+    border: none;
+}
+
+#sidebarScroll QWidget {
+    background-color: transparent;
+}
+
+/* 侧边栏分组标题 */
+#sidebarGroupHeader {
+    background-color: transparent;
+    color: #8A93A6;
+    font-size: 11px;
+    font-weight: 600;
+    text-align: left;
+    padding: 14px 16px 6px 16px;
+    border: none;
+    letter-spacing: 1px;
+}
+
+#sidebarGroupHeader:hover {
+    color: #B8C0D0;
+}
+
+#sidebarGroupHeader::menu-indicator {
+    image: none;
+}
+
+/* 侧边栏导航项 */
+#sidebarNavItem {
+    background-color: transparent;
+    color: #C2C9D6;
+    font-size: 13px;
+    text-align: left;
+    padding: 10px 14px 10px 18px;
+    border: none;
+    border-radius: 10px;
+    margin: 2px 10px;
+    icon-size: 18px;
+    padding-left: 16px;
+}
+
+#sidebarNavItem:hover {
+    background-color: rgba(74, 108, 247, 0.10);
+    color: #FFFFFF;
+}
+
+#sidebarNavItem:checked,
+#sidebarNavItem:checked:hover {
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:1,
+        stop:0 #3B5BDB,
+        stop:1 #7B61FF);
+    color: #FFFFFF;
+    font-weight: 600;
+}
+
+#sidebarScrollArea QScrollBar:vertical {
+    background-color: transparent;
+    width: 4px;
+    margin: 0;
+}
+#sidebarScrollArea QScrollBar::handle:vertical {
+    background-color: rgba(255, 255, 255, 30);
+    border-radius: 2px;
+    min-height: 24px;
+}
+#sidebarScrollArea QScrollBar::handle:vertical:hover {
+    background-color: rgba(74, 108, 247, 180);
+}
+#sidebarScrollArea QScrollBar::add-line:vertical,
+#sidebarScrollArea QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+/* ============ 顶部栏 ============ */
+#topBarRoot {
+    background-color: #0E1320;
+    border-bottom: 1px solid rgba(255, 255, 255, 6);
+}
+
+#topBarCenter {
+    background-color: transparent;
+}
+
+#topBarRight {
+    background-color: transparent;
+}
+
+/* 顶部布局选择器(胶囊) */
+#projectSelector {
+    background-color: rgba(255, 255, 255, 8);
+    color: #E6EAF2;
+    font-size: 13px;
+    border: 1px solid rgba(255, 255, 255, 10);
+    border-radius: 16px;
+    padding: 6px 14px;
+    min-height: 28px;
+}
+
+#projectSelector:hover {
+    background-color: rgba(74, 108, 247, 0.20);
+    border-color: rgba(74, 108, 247, 120);
+}
+
+#projectSelector::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 22px;
+    border: none;
+}
+
+#projectSelector::down-arrow {
+    image: none;
+    width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #8A93A6;
+    margin-right: 6px;
+}
+
+#projectSelector QAbstractItemView {
+    background-color: #161B2C;
+    color: #E6EAF2;
+    border: 1px solid rgba(255, 255, 255, 10);
+    border-radius: 8px;
+    selection-background-color: #3B5BDB;
+    selection-color: #FFFFFF;
+    outline: 0;
+    padding: 4px;
+}
+
+/* 顶部操作按钮(全屏/录屏/录制/帮助/更多) */
+#topActionButton {
+    background-color: transparent;
+    color: #C2C9D6;
+    font-size: 12px;
+    border: none;
+    border-radius: 8px;
+    padding: 4px 10px;
+    icon-size: 18px;
+    min-width: 56px;
+    min-height: 40px;
+    text-align: center;
+}
+
+#topActionButton:hover {
+    background-color: rgba(74, 108, 247, 0.12);
+    color: #FFFFFF;
+}
+
+#topActionButton:pressed {
+    background-color: rgba(74, 108, 247, 0.25);
+}
+
+/* ============ 中心画布 ============ */
+#centerCanvas {
+    background-color: #0B0F1A;
+}
+
+#canvasBg {
+    background-color: #0B0F1A;
+    border: none;
+}
+
+#canvasContent {
+    background-color: transparent;
+    border: none;
+}
+
+/* ============ 底部栏 ============ */
+#bottomBarRoot {
+    background-color: #0E1320;
+    border-top: 1px solid rgba(255, 255, 255, 6);
+}
+
+/* 底部布局选择胶囊 */
+#layoutPill {
+    background-color: rgba(20, 25, 40, 200);
+    border: 1px solid rgba(255, 255, 255, 8);
+    border-radius: 22px;
+}
+
+#layoutPillButton {
+    background-color: transparent;
+    color: #C2C9D6;
+    font-size: 12px;
+    border: none;
+    border-radius: 18px;
+    padding: 6px 14px;
+    icon-size: 18px;
+    min-width: 70px;
+}
+
+#layoutPillButton:hover {
+    background-color: rgba(74, 108, 247, 0.12);
+    color: #FFFFFF;
+}
+
+#layoutPillButton:checked {
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:1,
+        stop:0 #3B5BDB,
+        stop:1 #7B61FF);
+    color: #FFFFFF;
+    font-weight: 600;
+}
+
+/* 系统状态 */
+#systemStatusRoot {
+    background-color: transparent;
+}
+
+#statusCard {
+    background-color: transparent;
+    border: none;
+}
+
+#statusLabel {
+    color: #8A93A6;
+    font-size: 10px;
+    background-color: transparent;
+}
+
+#statusValue {
+    color: #FFFFFF;
+    font-size: 12px;
+    font-weight: 600;
+    background-color: transparent;
+}
+
+#statusUnit {
+    color: #6B7488;
+    font-size: 10px;
+    background-color: transparent;
+}
+
+#statusBar {
+    background-color: rgba(255, 255, 255, 10);
+    border: none;
+    border-radius: 2px;
+    max-height: 3px;
+    min-height: 3px;
+}
+
+#statusBar::chunk {
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 #3B5BDB,
+        stop:1 #7B61FF);
+    border-radius: 2px;
+}
+
+#systemClock {
+    color: #C2C9D6;
+    font-size: 13px;
+    font-weight: 600;
+    background-color: transparent;
+}
+
+#systemDate {
+    color: #6B7488;
+    font-size: 11px;
+    background-color: transparent;
+}
+
+/* 音量控制 */
+#volumeRoot {
+    background-color: rgba(20, 25, 40, 180);
+    border: 1px solid rgba(255, 255, 255, 8);
+    border-radius: 18px;
+    padding: 0 10px;
+}
+
+#volumeIcon {
+    background-color: transparent;
+    border: none;
+    color: #C2C9D6;
+    font-size: 16px;
+}
+
+#volumeIcon:hover {
+    color: #FFFFFF;
+}
+
+#volumeSlider {
+    background-color: transparent;
+    min-height: 22px;
+    max-width: 140px;
+}
+
+#volumeSlider::groove:horizontal {
+    background-color: rgba(255, 255, 255, 12);
+    height: 4px;
+    border-radius: 2px;
+}
+
+#volumeSlider::sub-page:horizontal {
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 #3B5BDB,
+        stop:1 #7B61FF);
+    height: 4px;
+    border-radius: 2px;
+}
+
+#volumeSlider::add-page:horizontal {
+    background-color: transparent;
+    height: 4px;
+    border-radius: 2px;
+}
+
+#volumeSlider::handle:horizontal {
+    background-color: #FFFFFF;
+    width: 12px;
+    height: 12px;
+    margin: -4px 0;
+    border-radius: 6px;
+    border: none;
+}
+
+#volumeSlider::handle:horizontal:hover {
+    background-color: #E6EAF2;
+}
+
+#volumePercent {
+    color: #E6EAF2;
+    font-size: 12px;
+    background-color: transparent;
+    min-width: 36px;
+}
+
+#volumeSettings {
+    background-color: transparent;
+    border: none;
+    color: #8A93A6;
+    font-size: 14px;
+    border-radius: 12px;
+    padding: 4px;
+}
+
+#volumeSettings:hover {
+    color: #FFFFFF;
+    background-color: rgba(74, 108, 247, 0.15);
+}
+
+/* 底部折叠按钮 */
+#bottomCollapseBtn {
+    background-color: rgba(20, 25, 40, 180);
+    color: #8A93A6;
+    border: 1px solid rgba(255, 255, 255, 8);
+    border-radius: 14px;
+    padding: 4px 6px;
+    font-size: 11px;
+}
+
+#bottomCollapseBtn:hover {
+    color: #FFFFFF;
+    background-color: rgba(74, 108, 247, 0.20);
+}
+
+/* ============ 会话卡片(深色) ============ */
+#sessionCard {
+    background-color: #161B2C;
+    border: 1px solid rgba(255, 255, 255, 8);
+    border-radius: 14px;
+}
+
+#sessionTopBar {
+    background-color: transparent;
+    border: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 6);
+    border-top-left-radius: 14px;
+    border-top-right-radius: 14px;
+}
+
+#sessionTitle {
+    color: #FFFFFF;
+    font-size: 13px;
+    font-weight: 600;
+    background-color: transparent;
+}
+
+#sessionStatus {
+    color: #8A93A6;
+    font-size: 11px;
+    background-color: transparent;
+}
+
+#sessionStatusOnline {
+    color: #4ADE80;
+    font-size: 11px;
+    font-weight: 600;
+    background-color: transparent;
+}
+
+#placeholderText {
+    color: #6B7488;
+    font-size: 13px;
+    background-color: transparent;
+}
+
+/* 空状态欢迎页 */
+#emptyLabel {
+    color: #8A93A6;
+    font-size: 14px;
+    background-color: transparent;
+}
+
+#emptyCard {
+    background-color: rgba(22, 27, 44, 160);
+    border: 1px solid rgba(255, 255, 255, 8);
+    border-radius: 18px;
+}
+
+/* 占位页面 */
+#placeholderPage {
+    background-color: transparent;
+}
+
+#placeholderTitle {
+    color: #FFFFFF;
+    font-size: 20px;
+    font-weight: 700;
+    background-color: transparent;
+}
+
+#placeholderSubtitle {
+    color: #6B7488;
+    font-size: 13px;
+    background-color: transparent;
+}
+
+#placeholderHint {
+    color: #8A93A6;
+    font-size: 12px;
+    background-color: rgba(74, 108, 247, 30);
+    border: 1px solid rgba(74, 108, 247, 80);
+    border-radius: 12px;
+    padding: 10px 18px;
+}
+
+/* ============ 工具提示 ============ */
+QToolTip {
+    background-color: #161B2C;
+    color: #E6EAF2;
+    border: 1px solid rgba(74, 108, 247, 120);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 11px;
+}
+
+/* ============ 通用按钮 ============ */
+QPushButton {
+    background-color: rgba(255, 255, 255, 8);
+    color: #E6EAF2;
+    border: 1px solid rgba(255, 255, 255, 10);
+    border-radius: 8px;
+    padding: 6px 14px;
+    font-size: 12px;
+}
+
+QPushButton:hover {
+    background-color: rgba(74, 108, 247, 0.20);
+    border-color: rgba(74, 108, 247, 120);
+}
+
+QPushButton:pressed {
+    background-color: rgba(74, 108, 247, 0.40);
+}
+
+QPushButton#primaryBtn {
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:1,
+        stop:0 #3B5BDB,
+        stop:1 #7B61FF);
+    color: #FFFFFF;
+    border: none;
+    font-weight: 600;
+}
+
+QPushButton#primaryBtn:hover {
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:1,
+        stop:0 #4F6FE5,
+        stop:1 #8B71FF);
+}
+
+QPushButton#primaryBtn:pressed {
+    background-color: #2D49B8;
+}
+
+/* ============ 状态栏 ============ */
+QStatusBar {
+    background-color: #0E1320;
+    color: #6B7488;
+    font-size: 11px;
+    border-top: 1px solid rgba(255, 255, 255, 6);
+}
+
+QStatusBar::item {
+    border: none;
+}
+
+/* ============ 悬浮控制台(无边框圆角面板) ============ */
+#ctrlPanelRoot {
+    background-color: #0E1320;
+    border: 1px solid rgba(255, 255, 255, 10);
+    border-radius: 14px;
+}
+
+#ctrlPanelTitleBar {
+    background-color: #0B0F1A;
+    border: none;
+    border-top-left-radius: 14px;
+    border-top-right-radius: 14px;
+    border-bottom: 1px solid rgba(255, 255, 255, 6);
+}
+
+#ctrlPanelTitleBtn {
+    background-color: transparent;
+    color: #8A93A6;
+    border: none;
+    border-radius: 4px;
+    font-size: 13px;
+}
+
+#ctrlPanelTitleBtn:hover {
+    background-color: rgba(74, 108, 247, 0.20);
+    color: #FFFFFF;
+}
+
+#ctrlPanelContent {
+    background-color: transparent;
+    border-bottom-left-radius: 14px;
+    border-bottom-right-radius: 14px;
+}
+
+/* 桌面上的"显示控制台"小按钮 */
+#toggleCtrlBtn {
+    background-color: rgba(14, 19, 32, 220);
+    color: #C2C9D6;
+    border: 1px solid rgba(255, 255, 255, 10);
+    border-radius: 16px;
+    padding: 4px 12px;
+    font-size: 12px;
+}
+
+#toggleCtrlBtn:hover {
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:1,
+        stop:0 #3B5BDB,
+        stop:1 #7B61FF);
+    color: #FFFFFF;
+    border-color: transparent;
+}
+
+/* ============ 菜单 ============ */
+QMenu {
+    background-color: #161B2C;
+    color: #E6EAF2;
+    border: 1px solid rgba(255, 255, 255, 10);
+    border-radius: 8px;
+    padding: 4px;
+}
+
+QMenu::item {
+    padding: 6px 18px;
+    border-radius: 6px;
+}
+
+QMenu::item:selected {
+    background-color: rgba(74, 108, 247, 0.25);
+    color: #FFFFFF;
+}
+
+QMenu::separator {
+    height: 1px;
+    background-color: rgba(255, 255, 255, 8);
+    margin: 4px 8px;
+}
