@@ -93,6 +93,10 @@ int main(int argc, char *argv[])
 
     // 启动后自动开启 AirPlay 网关(多设备自动调度);
     QTimer::singleShot(200, &desktop, &DesktopWindow::startAirPlay);
+    // 启动后自动开启 Miracast 接收(激活 UWP 接收进程, 安卓可搜到);
+    QTimer::singleShot(600, &desktop, &DesktopWindow::startMiracast);
+    // 启动后自动开启 MS-MICE 接收端(Win+K 基础设施投屏, Windows 笔记本可搜到);
+    QTimer::singleShot(1000, &desktop, &DesktopWindow::startMiceBackend);
 
     qInfo() << "entering event loop";
     return app.exec();

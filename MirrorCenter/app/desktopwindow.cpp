@@ -140,7 +140,16 @@ void DesktopWindow::setLayoutMode(int mode)
 void DesktopWindow::relayout()
 {
     const int maxG = maxGrid();
-    const int n = qMin(m_views.size(), maxG);
+
+    // 只统计已激活(有真实画面)的会话:AirPlay 连接即激活;
+    // Miracast 占位会话在收到首帧前保持隐藏, 不出现在主窗口/列表。
+    QList<SessionView *> active;
+    for (SessionView *view : m_views) {
+        if (view->isActive())
+            active.append(view);
+    }
+
+    const int n = qMin(active.size(), maxG);
 
     // 布局列数:0=按会话数自动(1全屏/2左右/3~4四宫格), 手动模式尊重控制台选择
     // 受解码能力限制:软解最多 4 格, 硬解最多 16 格
@@ -169,26 +178,28 @@ void DesktopWindow::relayout()
 
     // 当前应显示的视图序列(排除焦点外与超出解码上限的会话)
     QList<SessionView *> shown;
-    if (!m_views.isEmpty()) {
-        for (SessionView *view : m_views) {
-            if (m_focusView && view != m_focusView)
-                continue;
-            if (shown.size() >= maxG)
-                continue;
-            shown.append(view);
-        }
+    for (SessionView *view : active) {
+        if (m_focusView && view != m_focusView)
+            continue;
+        if (shown.size() >= maxG)
+            continue;
+        shown.append(view);
     }
+
+    // 单路铺满时:视频填满整窗(居中裁剪, 无黑边);多路网格则等比留边
+    for (SessionView *view : m_views)
+        view->setFillMode(fullBleed && shown.size() == 1 && shown.contains(view));
 
     // ---- 快速路径:布局无变化则跳过, 避免切换时重建容器导致闪烁 ----
     if (m_lastShown == shown && m_lastCols == cols && m_lastRows == rows
-        && m_lastFullBleed == fullBleed && m_lastEmpty == m_views.isEmpty()) {
+        && m_lastFullBleed == fullBleed && m_lastEmpty == active.isEmpty()) {
         return;
     }
     m_lastShown = shown;
     m_lastCols  = cols;
     m_lastRows  = rows;
     m_lastFullBleed = fullBleed;
-    m_lastEmpty = m_views.isEmpty();
+    m_lastEmpty = active.isEmpty();
 
     // 只删除布局项, 不 reparent 视图 —— setParent(nullptr) 会重建嵌入的
     // d3d11 原生窗口容器, 是切换/重排时画面闪烁的根源
@@ -199,7 +210,7 @@ void DesktopWindow::relayout()
                                        fullBleed ? 0 : 12, fullBleed ? 0 : 12);
     m_grid->setSpacing(fullBleed ? 0 : 4);
 
-    if (m_views.isEmpty()) {
+    if (active.isEmpty()) {
         if (m_emptyCard) {
             m_emptyCard->show();
             m_grid->addWidget(m_emptyCard, 0, 0);
@@ -224,12 +235,12 @@ void DesktopWindow::relayout()
             view->hide();
     }
     emit statusMessage(QStringLiteral("会话数: %1  ·  布局: %2 路%3")
-                           .arg(m_views.size())
+                           .arg(active.size())
                            .arg(m_layoutMode ? m_layoutMode : qMax(1, cols))
-                           .arg(shown.size() < m_views.size()
+                           .arg(shown.size() < active.size()
                                     ? QStringLiteral("  ·  超出解码上限, 仅显示 %1 路").arg(shown.size())
                                     : QString()));
-    emit sessionCountChanged(m_views.size());
+    emit sessionCountChanged(active.size());
 }
 
 void DesktopWindow::onViewFullscreen(const QString &sessionId)
@@ -283,9 +294,69 @@ void DesktopWindow::startAirPlay()
 void DesktopWindow::startMiracast()
 {
     if (m_miracastStarted) return;
-    addSession(QStringLiteral("MirrorCenter-Miracast"), MIRROR_BACKEND_MIRACAST);
     m_miracastStarted = true;
-    emit statusMessage(QStringLiteral("Miracast 接收已启动"));
+
+    // 4 路 Miracast 槽位:Windows.Media.Miracast 原生支持多路同时连接,
+    // 单服务进程承载全部连接, 每路独立帧端口。实际并发路数受网卡驱动硬件
+    // 上限(MiracastReceiverStatus.MaxSimultaneousConnections)约束。
+    constexpr int kMiracastSlots = 4;
+    mirror_session_t *sessions[8] = {};
+    int count = 0;
+    const mirror_result_t rc = mirror_start_miracast_group(
+        kMiracastSlots, "MirrorCenter", nullptr, sessions, &count);
+    if (rc != MIRROR_OK || count <= 0) {
+        m_miracastStarted = false;
+        emit statusMessage(QStringLiteral("Miracast 启动失败: %1")
+                               .arg(QString::fromUtf8(mirror_last_error())));
+        return;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        const QString name = QStringLiteral("Miracast-%1").arg(i + 1);
+        // deferStart=true:会话由 SDK 组 API 创建, 视图只接管句柄(adoptManualSession)
+        auto *view = new SessionView(name, MIRROR_BACKEND_MIRACAST, m_canvasInner,
+                                     /* deferStart */ true);
+        connect(view, &SessionView::sessionClosed,
+                this, &DesktopWindow::onSessionClosed);
+        connect(view, &SessionView::fullscreenRequested,
+                this, &DesktopWindow::onViewFullscreen);
+        // 首帧前保持隐藏(Miracast 占位会话);收到首帧才在主窗口/列表出现
+        connect(view, &SessionView::firstFrameReceived, this, [this]() {
+            relayout();
+            emit sourcesChanged();
+        });
+        view->adoptManualSession(sessions[i], name);
+        m_views.append(view);
+    }
+    emit statusMessage(QStringLiteral("Miracast 接收已启动(%1 路槽位)").arg(count));
+    relayout();
+    emit sourcesChanged();
+}
+
+void DesktopWindow::startMiceBackend()
+{
+    if (m_miceStarted)
+        return;
+    m_miceStarted = true;
+
+    // MS-MICE(Win+K 基础设施投屏):mDNS 发布 _display._tcp(container_id),
+    // Windows 发送端自动发现并连入;媒体走局域网/有线, 多路不受 Wi-Fi
+    // Direct 硬件上限约束, 普通网卡即可承载。
+    mirror_gateway_callbacks_t cbs;
+    cbs.on_log                = &DesktopWindow::gatewayLogCallback;
+    cbs.on_client_connected   = &DesktopWindow::gatewayClientConnectedCallback;
+    cbs.on_client_disconnected = &DesktopWindow::gatewayClientDisconnectedCallback;
+    cbs.on_client_info        = &DesktopWindow::gatewayClientInfoCallback;
+    cbs.on_decoder            = &DesktopWindow::gatewayDecoderCallback;
+
+    const mirror_result_t rc = mirror_start_mice_backend("MirrorCenter", &cbs, this);
+    if (rc != MIRROR_OK) {
+        m_miceStarted = false;
+        emit statusMessage(QStringLiteral("MS-MICE 接收端启动失败: %1")
+                               .arg(QString::fromUtf8(mirror_last_error())));
+        return;
+    }
+    emit statusMessage(QStringLiteral("MS-MICE 接收已启动(笔记本 Win+K 可搜到 MirrorCenter)"));
 }
 
 SessionView *DesktopWindow::addSession(const QString &name, mirror_backend_t backend)
@@ -295,6 +366,11 @@ SessionView *DesktopWindow::addSession(const QString &name, mirror_backend_t bac
             this, &DesktopWindow::onSessionClosed);
     connect(view, &SessionView::fullscreenRequested,
             this, &DesktopWindow::onViewFullscreen);
+    // 首帧前保持隐藏(Miracast 占位会话);收到首帧才在主窗口/列表出现
+    connect(view, &SessionView::firstFrameReceived, this, [this]() {
+        relayout();
+        emit sourcesChanged();
+    });
     m_views.append(view);
     relayout();
     emit sourcesChanged();
@@ -305,8 +381,8 @@ QList<SourceItem> DesktopWindow::sourceItems() const
 {
     QList<SourceItem> items;
     for (SessionView *view : m_views) {
-        if (!view)
-            continue;
+        if (!view || !view->isActive())
+            continue;   // 未出画的占位会话不出现在列表
         SourceItem it;
         it.sessionId = view->sessionId();
         it.name    = view->deviceName();
@@ -457,21 +533,28 @@ void DesktopWindow::onGatewayClientConnected(mirror_session_t *session, const QS
     if (mirror_get_state(session) == MIRROR_STATE_CLOSED)
         return;
 
-    auto *view = new SessionView(ip,   // 初始显示来源 IP, 手机名随后由 clientInfo 回调更新
-                                 MIRROR_BACKEND_AIRPLAY, m_canvasInner);
+    // MS-MICE 会话由 SDK 以 "MICE:" 前缀标记, 显示 Source 友好名(而非 IP)
+    const bool isMice = ip.startsWith(QStringLiteral("MICE:"));
+    const QString displayName = isMice ? ip.mid(5) : ip;
+
+    auto *view = new SessionView(displayName,
+                                 isMice ? MIRROR_BACKEND_MICE : MIRROR_BACKEND_AIRPLAY,
+                                 m_canvasInner);
     connect(view, &SessionView::sessionClosed,
             this, &DesktopWindow::onSessionClosed);
     connect(view, &SessionView::fullscreenRequested,
             this, &DesktopWindow::onViewFullscreen);
 
-    view->adoptGatewaySession(session, ip);
+    view->adoptGatewaySession(session, displayName);
     m_views.append(view);
     {
         QMutexLocker locker(&m_gatewayMutex);
         m_gatewayViews.insert(session, view);
     }
     relayout();
-    emit statusMessage(QStringLiteral("设备 %1 已连入").arg(ip));
+    emit statusMessage(isMice
+                           ? QStringLiteral("Windows 设备 %1 已连入").arg(displayName)
+                           : QStringLiteral("设备 %1 已连入").arg(ip));
     emit sourcesChanged();
 }
 
@@ -483,28 +566,59 @@ void DesktopWindow::onGatewayClientDisconnected(mirror_session_t *session)
 
 void DesktopWindow::onSessionClosed(const QString &sessionId)
 {
-    for (int i = 0; i < m_views.size(); ++i) {
-        if (m_views[i]->sessionId() == sessionId) {
-            const bool wasMira = (m_views[i]->deviceName() == QStringLiteral("MirrorCenter-Miracast"));
-            // 从网关视图表移除(若存在)
-            {
-                QMutexLocker locker(&m_gatewayMutex);
-                for (auto it = m_gatewayViews.begin(); it != m_gatewayViews.end(); ) {
-                    if (it.value() == m_views[i])
-                        it = m_gatewayViews.erase(it);
-                    else
-                        ++it;
-                }
-            }
-            const bool wasFocus = (m_focusView == m_views[i]);
-            m_views[i]->deleteLater();
-            m_views.removeAt(i);
-            if (wasFocus)
-                m_focusView = nullptr;
-            if (wasMira) m_miracastStarted = false;
-            break;
-        }
+    // 找出触发关闭的视图
+    SessionView *closed = nullptr;
+    for (SessionView *v : m_views) {
+        if (v->sessionId() == sessionId) { closed = v; break; }
     }
+    if (!closed)
+        return;
+
+    // Miracast 组:所有路共享同一服务进程(任一路断开会整组失效),
+    // 关闭任一路时整组一起关闭。
+    const bool closeAllMiracast = closed->deviceName().startsWith(QStringLiteral("Miracast"));
+
+    QList<SessionView *> toRemove;
+    for (SessionView *v : m_views) {
+        if (v == closed)
+            toRemove.append(v);
+        else if (closeAllMiracast && v->deviceName().startsWith(QStringLiteral("Miracast")))
+            toRemove.append(v);
+    }
+
+    for (SessionView *view : toRemove) {
+        const bool wasFocus = (m_focusView == view);
+        // 从网关视图表移除(若存在)
+        {
+            QMutexLocker locker(&m_gatewayMutex);
+            for (auto it = m_gatewayViews.begin(); it != m_gatewayViews.end(); ) {
+                if (it.value() == view)
+                    it = m_gatewayViews.erase(it);
+                else
+                    ++it;
+            }
+        }
+        m_views.removeOne(view);
+        view->stop();
+        view->deleteLater();
+        if (wasFocus)
+            m_focusView = nullptr;
+    }
+
+    // 已无 Miracast 视图 → 允许重新启动整组
+    bool hasMira = false;
+    for (SessionView *v : m_views)
+        if (v->deviceName().startsWith(QStringLiteral("Miracast"))) { hasMira = true; break; }
+    if (!hasMira)
+        m_miracastStarted = false;
+
+    // 已无 MS-MICE 会话 → 允许重新启动接收端
+    bool hasMice = false;
+    for (SessionView *v : m_views)
+        if (v->backend() == MIRROR_BACKEND_MICE) { hasMice = true; break; }
+    if (!hasMice)
+        m_miceStarted = false;
+
     relayout();
     emit sourcesChanged();
 }

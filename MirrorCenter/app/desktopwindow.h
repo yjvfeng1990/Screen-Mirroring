@@ -61,6 +61,7 @@ public:
 public slots:
     void startAirPlay();
     void startMiracast();
+    void startMiceBackend();
     void toggleFullscreen();
     void onSessionClosed(const QString &sessionId);
     /** 控制台选中某来源 → 把它排到主窗口首位 */
@@ -108,6 +109,7 @@ protected:
     int  m_layoutMode = 0;   // 0=按会话数自动(1全屏/2左右/3+四宫格), 1/2/3/4/6=手动覆盖
     bool m_gatewayStarted  = false;   // AirPlay 网关已启动(幂等)
     bool m_miracastStarted = false;
+    bool m_miceStarted     = false;   // MS-MICE 接收端已启动(幂等)
     QString m_decoder;                 // 实例上报的实际视频解码器(空=未知)
     int  m_maxGrid = 16;               // 根据解码器限定的最大格数(软解4/硬解16)
 

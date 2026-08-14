@@ -51,8 +51,8 @@ void MirrorSession::start()
     if (m_process)
         return;
 
-    // Windows Miracast 采用"外部激活"模式:UWP 接收进程已由 SDK 通过
-    // ShellExecute 协议激活拉起,本会话不再启动 QProcess,只建立 TCP 帧连接。
+    // Windows Miracast:接收由桌面辅助进程(MiracastReceiverService.exe)承担,
+    // 无窗口、无 UWP 挂起限制。子进程作为普通 QProcess 启动(见下方流程)。
     if (m_backendExe.isEmpty()) {
         if (m_frameMode) {
             m_frameClient = new FrameClient(this);
@@ -62,10 +62,11 @@ void MirrorSession::start()
                     this, &MirrorSession::onFrameClientDisconnected);
             connect(m_frameClient, &FrameClient::frameReady,
                     this, [this]() { emit frameReady(m_id); });
-            m_frameClient->connectToServer(QHostAddress(m_frameAddress), m_framePort);
+            // UWP 出站连接本机监听端口(AppContainer 入站隔离,方向必须反转)
+            m_frameClient->startListening(m_framePort);
         }
         setState(SessionState::Starting);
-        emit logMessage(m_id, QStringLiteral("external activation, frame mode port=%1")
+        emit logMessage(m_id, QStringLiteral("external activation, frame mode listen port=%1")
                                 .arg(m_framePort));
         return;
     }
@@ -107,14 +108,14 @@ void MirrorSession::start()
         connect(m_frameClient, &FrameClient::disconnected, this, &MirrorSession::onFrameClientDisconnected);
         connect(m_frameClient, &FrameClient::frameReady,
                 this, [this]() { emit frameReady(m_id); });
-        m_frameClient->connectToServer(QHostAddress(m_frameAddress), m_framePort);
+        m_frameClient->startListening(m_framePort);
     }
 }
 
 void MirrorSession::stop()
 {
     if (m_frameClient) {
-        m_frameClient->disconnectFromServer();
+        m_frameClient->stopListening();
         m_frameClient->deleteLater();
         m_frameClient = nullptr;
     }

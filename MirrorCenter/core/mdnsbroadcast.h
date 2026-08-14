@@ -45,9 +45,20 @@ public:
      * @param hostName 主机名, 如 "mirrorcenter.local"(A 记录使用)
      * @param ipv4     本机局域网 IPv4
      * @param services 要广播的服务列表
+     * @param ipv6     本机局域网 IPv6(可选)。Windows 发送端双栈解析
+     *                 hostname 时会同时查 AAAA, 不响应则解析可能失败。
      */
     bool start(const QString &hostName, const QHostAddress &ipv4,
-               const QList<Service> &services);
+               const QList<Service> &services,
+               const QHostAddress &ipv6 = QHostAddress());
+    /**
+     * 设置 A 记录别名主机名(如电脑名 "MS-ATMGSTZUMKFQ.local")。
+     * Windows 发送端解析 MS-MICE Sink 时用的是 WFD Host Name 属性
+     * (0x2002, 系统自动广播电脑名, MiracastReceiverSettings 无法修改),
+     * 必须让 mDNS 同时响应电脑名的 A 记录查询, 否则解析失败回退
+     * Wi-Fi Direct P2P(USB 网卡易崩 GO)。
+     */
+    void setHostAliases(const QStringList &aliases);
     void stop();
 
 private slots:
@@ -71,7 +82,10 @@ private:
     QUdpSocket *m_sock = nullptr;
     QTimer *m_announceTimer = nullptr;   // 周期 announce 兜底(错过查询的设备也能看到)
     QString m_hostName;
+    QStringList m_hostAliases;      // A 记录别名(如电脑名), Windows 发送端解析用
+    QStringList m_lastQueries;      // 最近一次查询去重, 避免刷日志
     QHostAddress m_ipv4;
+    QHostAddress m_ipv6;            // AAAA 记录地址(可选)
     QList<Service> m_services;
     bool m_started = false;
 };

@@ -2,6 +2,7 @@
 #include "sessionmanager.h"
 #include "mirrorsession.h"
 #include "airplaygateway.h"
+#include "mice/micebackend.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -15,6 +16,7 @@
 #include <QMetaObject>
 #include <QTimer>
 #include <QTcpServer>
+#include <QFile>
 #include <cstdio>
 #include <QDebug>
 #include <utility>
@@ -51,6 +53,10 @@ static AirPlayGateway *g_gateway = nullptr;       // 生命周期:事件线程,�
 static mirror_gateway_callbacks_t g_gatewayCbs{};
 static void *g_gatewayUserdata = nullptr;
 static QSet<mirror_session_t *> g_gatewayHandles; // 网关创建的会话句柄(回收时统一释放)
+
+/* ---- MS-MICE(基础设施投屏)接收端 ---- */
+static MiceBackend *g_miceBackend = nullptr;                     // 生命周期:事件线程
+static QHash<QByteArray, mirror_session_t *> g_miceHandles;      // sourceId → 会话句柄
 
 /* 错误说明(线程本地) */
 static thread_local char g_lastError[256];
@@ -357,6 +363,109 @@ static void stopGatewayAndCleanHandles()
     }
 }
 
+/*
+ * 连接 MS-MICE 后端信号 → SDK 会话句柄与宿主回调。
+ * 每路 Source 一个句柄;帧经 frameCache 缓存,宿主用 mirror_get_frame 拉取。
+ */
+static void connectMiceSignals(MiceBackend *backend)
+{
+    QObject::connect(backend, &MiceBackend::sourceConnected, backend,
+                     [](const QString &friendlyName, const QByteArray &sourceId) {
+        if (g_miceHandles.contains(sourceId))
+            return;
+        auto *handle = new mirror_session_t();
+        handle->core = nullptr;   // MS-MICE 无后端子进程;帧走 frameCache
+        handle->valid = true;
+        if (!registerHandle(handle)) {
+            delete handle;
+            return;
+        }
+        {
+            QMutexLocker lock(&g_mutex);
+            g_miceHandles.insert(sourceId, handle);
+        }
+        if (g_gatewayCbs.on_client_connected) {
+            const QByteArray nameUtf8 = friendlyName.toUtf8();
+            // 第二个参数带 "MICE:" 前缀, 供 UI 区分 MS-MICE 会话与 AirPlay 网关
+            const QByteArray tagged = "MICE:" + nameUtf8;
+            g_gatewayCbs.on_client_connected(handle, tagged.constData(),
+                                             g_gatewayUserdata);
+        }
+    });
+
+    QObject::connect(backend, &MiceBackend::sourceDisconnected, backend,
+                     [](const QByteArray &sourceId) {
+        mirror_session_t *handle = nullptr;
+        {
+            QMutexLocker lock(&g_mutex);
+            handle = g_miceHandles.take(sourceId);
+        }
+        if (!handle)
+            return;
+        if (g_gatewayCbs.on_client_disconnected) {
+            g_gatewayCbs.on_client_disconnected(handle, "", g_gatewayUserdata);
+        }
+        unregisterHandle(handle);
+        handle->valid = false;
+        handle->core = nullptr;
+        delete handle;
+    });
+
+    QObject::connect(backend, &MiceBackend::frameReady, backend,
+                     [](const QByteArray &sourceId, const QImage &frame) {
+        mirror_session_t *handle = nullptr;
+        {
+            QMutexLocker lock(&g_mutex);
+            handle = g_miceHandles.value(sourceId);
+        }
+        if (!handle)
+            return;
+        {
+            QMutexLocker lock(&g_mutex);
+            handle->frameCache = frame;
+        }
+        if (handle->cbs.on_frame)
+            handle->cbs.on_frame(handle, handle->userdata);
+    });
+
+    QObject::connect(backend, &MiceBackend::logMessage, backend,
+                     [](const QString &msg) {
+        if (g_gatewayCbs.on_log) {
+            const QByteArray utf8 = msg.toUtf8();
+            g_gatewayCbs.on_log(utf8.constData(), g_gatewayUserdata);
+        }
+    });
+}
+
+/* 停止 MS-MICE 后端并回收其会话句柄。 */
+static void stopMiceAndCleanHandles()
+{
+    MiceBackend *backend = nullptr;
+    QList<mirror_session_t *> handles;
+    {
+        QMutexLocker lock(&g_mutex);
+        backend = g_miceBackend;
+        g_miceBackend = nullptr;
+        handles = g_miceHandles.values();
+        g_miceHandles.clear();
+    }
+
+    if (backend) {
+        invokeOnManager([backend]() {
+            backend->disconnect();
+            backend->stop();
+            backend->deleteLater();
+        });
+    }
+
+    for (mirror_session_t *h : handles) {
+        unregisterHandle(h);
+        h->valid = false;
+        h->core = nullptr;
+        delete h;
+    }
+}
+
 /* ============ SDK 实现 ============ */
 
 extern "C" {
@@ -526,6 +635,67 @@ MIRROR_API mirror_result_t mirror_stop_airplay_gateway(void)
     return MIRROR_OK;
 }
 
+MIRROR_API mirror_result_t mirror_start_mice_backend(
+    const char *device_name,
+    const mirror_gateway_callbacks_t *cbs,
+    void *userdata)
+{
+    {
+        QMutexLocker lock(&g_mutex);
+        if (!g_initialized)
+            return MIRROR_ERR_NOT_INITIALIZED;
+        if (g_miceBackend)
+            return MIRROR_OK;   // 已启动, 幂等
+    }
+
+    MiceBackend::Config cfg;
+    cfg.deviceName = (device_name && *device_name)
+                         ? QString::fromUtf8(device_name)
+                         : QStringLiteral("MirrorCenter");
+
+    mirror_gateway_callbacks_t cbsCopy{};
+    if (cbs)
+        cbsCopy = *cbs;
+    {
+        QMutexLocker lock(&g_mutex);
+        g_gatewayCbs = cbsCopy;
+        g_gatewayUserdata = userdata;
+    }
+
+    MiceBackend *backend = nullptr;
+    invokeOnManager([&]() {
+        auto *b = new MiceBackend(cfg);
+        connectMiceSignals(b);
+        if (!b->start()) {
+            qWarning() << "[sdk] mice backend start failed";
+            delete b;
+            return;
+        }
+        backend = b;
+    });
+    if (!backend) {
+        QMutexLocker lock(&g_mutex);
+        g_gatewayCbs = mirror_gateway_callbacks_t{};
+        g_gatewayUserdata = nullptr;
+        setError("mice backend start failed");
+        return MIRROR_ERR_SESSION_FAILED;
+    }
+
+    {
+        QMutexLocker lock(&g_mutex);
+        g_miceBackend = backend;
+    }
+    setError("ok");
+    return MIRROR_OK;
+}
+
+MIRROR_API mirror_result_t mirror_stop_mice_backend(void)
+{
+    stopMiceAndCleanHandles();
+    setError("ok");
+    return MIRROR_OK;
+}
+
 MIRROR_API void mirror_shutdown(void)
 {
     QMutexLocker lock(&g_mutex);
@@ -534,6 +704,8 @@ MIRROR_API void mirror_shutdown(void)
 
     // 先停网关(其实例会话句柄由网关持有, 需先回收)
     stopGatewayAndCleanHandles();
+    // 再停 MS-MICE 接收端
+    stopMiceAndCleanHandles();
 
     // 清理所有会话句柄(标记失效并停止)
     for (auto it = g_sessions.begin(); it != g_sessions.end(); ++it) {
@@ -599,8 +771,15 @@ MIRROR_API mirror_result_t mirror_start_session(mirror_backend_t backend,
     if (exe.isEmpty()) {
         if (type == BackendType::Miracast) {
 #ifdef _WIN32
-            // Windows: Miracast 接收由 UWP 辅助进程承担,通过 shell:AppsFolder 启动
-            exe = QStringLiteral("explorer.exe");
+            // Windows: Miracast 接收由桌面辅助进程承担(无窗口,无 UWP 挂起限制)。
+            // 随程序部署在 miracast-service/ 目录。
+            const QString svc = QDir(QCoreApplication::applicationDirPath())
+                                    .filePath(QStringLiteral("miracast-service/MiracastReceiverService.exe"));
+            if (QFile::exists(svc))
+                exe = svc;
+            else
+                exe = g_manager->findBackendExe({QStringLiteral("MiracastReceiverService.exe"),
+                                                 QStringLiteral("miracast-service/MiracastReceiverService.exe")});
 #else
             exe = g_manager->findBackendExe({QStringLiteral("miracle-sinkctl")});
 #endif
@@ -640,9 +819,8 @@ MIRROR_API mirror_result_t mirror_start_session(mirror_backend_t backend,
     }
 
 #ifdef _WIN32
-    // Windows Miracast 帧模式:分配空闲端口,通过 miracast:// 协议激活 UWP 接收进程,
-    // Qt 侧连该端口收帧。不用 QProcess/explorer 启动 —— explorer 会把协议 URL 当作
-    // 本地路径解析(失败则回退打开"文档"文件夹),必须用 ShellExecuteW 触发协议激活。
+    // Windows Miracast:分配空闲端口,Qt 侧监听,桌面接收服务出站连接发送帧。
+    // 帧经 TCP 发送到 MirrorCenter,由 GStreamer appsrc→d3d11videosink 渲染。
     quint16 framePort = 0;
     if (type == BackendType::Miracast) {
         QTcpServer probe;
@@ -650,9 +828,8 @@ MIRROR_API mirror_result_t mirror_start_session(mirror_backend_t backend,
         framePort = probe.serverPort();
         probe.close();
 
-        // 外部激活模式:无子进程,由 ShellExecuteW 在下方激活
-        exe.clear();
-        argList.clear();
+        argList << QStringLiteral("--port") << QString::number(framePort)
+                << QStringLiteral("--name") << name;
     }
 #endif
 
@@ -671,30 +848,13 @@ MIRROR_API mirror_result_t mirror_start_session(mirror_backend_t backend,
     }
     qInfo() << "[sdk] session created, id=" << handle->core->id().toUtf8().constData();
 
-#ifdef _WIN32
-    // 帧模式:通过 miracast:// 协议激活 UWP 接收进程(带端口/名称参数),
-    // Qt 侧随后连接其 TCP 帧服务器。
-    if (type == BackendType::Miracast && framePort != 0) {
-        QPointer<MirrorSession> core = handle->core;
-        invokeOnManager([core, framePort]() {
-            if (core)
-                core->setFrameMode(QStringLiteral("127.0.0.1"), framePort);
-        });
-
-        const QString url = QStringLiteral("miracast://receive?port=%1&name=%2")
-                                .arg(framePort).arg(name);
-        qInfo() << "[sdk] ShellExecute protocol activation:" << url.toUtf8().constData();
-        const HINSTANCE r = ShellExecuteW(nullptr, L"open",
-                                          reinterpret_cast<LPCWSTR>(url.utf16()),
-                                          nullptr, nullptr, SW_SHOWNORMAL);
-        if (reinterpret_cast<INT_PTR>(r) <= 32) {
-            qWarning() << "[sdk] ShellExecuteW failed, err="
-                       << reinterpret_cast<INT_PTR>(r);
-        }
+    // Miracast:启用 frame mode,TCP 端口由服务出站连接(FrameClient 在本地监听)
+    if (type == BackendType::Miracast && framePort > 0) {
+        handle->core->setFrameMode(QStringLiteral("127.0.0.1"), framePort);
+        qInfo() << "[sdk] frameMode port=" << framePort;
     }
-#endif
 
-    // 启动子进程
+    // 启动子进程(swap chain 模式:服务输出 WINDOW_HANDLE 到 stdout)
     QPointer<MirrorSession> core = handle->core;
     qInfo() << "[sdk] invoking core->start()";
     invokeOnManager([core]() {
@@ -722,6 +882,131 @@ MIRROR_API mirror_result_t mirror_stop_session(mirror_session_t *session)
                 core->stop();
         });
     }
+    return MIRROR_OK;
+}
+
+MIRROR_API mirror_result_t mirror_start_miracast_group(
+    int count,
+    const char *device_name,
+    const char *exe_path,
+    mirror_session_t **out_sessions,
+    int *out_count)
+{
+    if (!out_sessions || !out_count)
+        return MIRROR_ERR_INVALID_ARG;
+    if (count < 1 || count > 8)
+        return MIRROR_ERR_INVALID_ARG;
+    *out_count = 0;
+
+    QMutexLocker lock(&g_mutex);
+    if (!g_initialized)
+        return MIRROR_ERR_NOT_INITIALIZED;
+
+    QString name = device_name ? QString::fromUtf8(device_name) : QString();
+    if (name.isEmpty())
+        name = QStringLiteral("Miracast");
+
+    // 后端 exe:仅主会话(0)承载服务进程,从会话(1..)为纯帧监听
+    QString exe = exe_path ? QString::fromUtf8(exe_path) : QString();
+    if (exe.isEmpty()) {
+#ifdef _WIN32
+        const QString svc = QDir(QCoreApplication::applicationDirPath())
+                                .filePath(QStringLiteral("miracast-service/MiracastReceiverService.exe"));
+        if (QFile::exists(svc))
+            exe = svc;
+        else
+            exe = g_manager->findBackendExe({QStringLiteral("MiracastReceiverService.exe"),
+                                             QStringLiteral("miracast-service/MiracastReceiverService.exe")});
+#else
+        exe = g_manager->findBackendExe({QStringLiteral("miracle-sinkctl")});
+#endif
+    }
+
+    // 分配 count 个空闲帧端口(宿主每路一个 FrameClient 监听)
+    QList<quint16> ports;
+    for (int i = 0; i < count; ++i) {
+        QTcpServer probe;
+        if (!probe.listen(QHostAddress::LocalHost, 0)) {
+            setError("no free frame port");
+            return MIRROR_ERR_SESSION_FAILED;
+        }
+        ports.append(probe.serverPort());
+        probe.close();
+    }
+
+    QStringList portStrs;
+    for (quint16 p : ports)
+        portStrs << QString::number(p);
+    // 主会话:单服务进程承载全部连接, --ports p0,.. --max count
+    QStringList argList;
+    argList << QStringLiteral("--ports") << portStrs.join(QLatin1Char(','))
+            << QStringLiteral("--max") << QString::number(count)
+            << QStringLiteral("--name") << name;
+
+    // 创建句柄
+    QVector<mirror_session_t *> handles;
+    handles.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        auto *h = new mirror_session_t();
+        h->valid = true;
+        registerHandle(h);
+        handles.append(h);
+    }
+
+    // 事件线程逐个创建 core
+    bool allOk = true;
+    for (int i = 0; i < count; ++i) {
+        bool ok = false;
+        CreateArg createArg;
+        createArg.type = BackendType::Miracast;
+        createArg.deviceName = (i == 0) ? name
+                                        : QStringLiteral("%1-%2").arg(name).arg(i + 1);
+        createArg.exePath = (i == 0) ? exe : QString();
+        createArg.args = (i == 0) ? argList : QStringList();
+        invokeOnManager([mgr = g_manager, createArg, handle = handles[i], &ok]() {
+            createSessionInThread(mgr, createArg, handle, &ok);
+        });
+        if (!ok || !handles[i]->core) {
+            allOk = false;
+            break;
+        }
+    }
+
+    if (!allOk) {
+        for (mirror_session_t *h : handles) {
+            if (h->core) {
+                QPointer<MirrorSession> core = h->core;
+                invokeOnManager([core]() {
+                    if (core) {
+                        core->stop();
+                        core->deleteLater();
+                    }
+                });
+                h->core = nullptr;
+            }
+            unregisterHandle(h);
+            h->valid = false;
+            delete h;
+        }
+        setError("failed to create miracast group");
+        return MIRROR_ERR_SESSION_FAILED;
+    }
+
+    // 每路帧模式 + 启动(主会话启动服务进程,从会话走 external activation 纯监听)
+    for (int i = 0; i < count; ++i)
+        handles[i]->core->setFrameMode(QStringLiteral("127.0.0.1"), ports[i]);
+    for (int i = 0; i < count; ++i) {
+        QPointer<MirrorSession> core = handles[i]->core;
+        invokeOnManager([core]() {
+            if (core)
+                core->start();
+        });
+    }
+
+    for (int i = 0; i < count; ++i)
+        out_sessions[i] = handles[i];
+    *out_count = count;
+    setError("ok");
     return MIRROR_OK;
 }
 
@@ -778,8 +1063,12 @@ MIRROR_API uint64_t mirror_get_process_id(mirror_session_t *session)
 
 MIRROR_API mirror_state_t mirror_get_state(mirror_session_t *session)
 {
-    if (!session || !isHandleValid(session) || !session->core)
+    if (!session || !isHandleValid(session))
         return MIRROR_STATE_CLOSED;
+    if (!session->core) {
+        // MS-MICE 等无后端子进程的句柄: 会话存活即视为运行中
+        return MIRROR_STATE_RUNNING;
+    }
 
     switch (session->core->state()) {
     case SessionState::Starting:   return MIRROR_STATE_STARTING;
@@ -802,13 +1091,21 @@ MIRROR_API const char *mirror_get_device_name(mirror_session_t *session)
 MIRROR_API mirror_result_t mirror_get_frame(mirror_session_t *session,
                                             mirror_frame_t *frame)
 {
-    if (!session || !frame || !isHandleValid(session) || !session->core)
+    if (!session || !frame || !isHandleValid(session))
         return MIRROR_ERR_INVALID_ARG;
 
-    const QImage img = session->core->latestFrame();
+    QImage img;
+    if (session->core) {
+        img = session->core->latestFrame();
+    } else {
+        // MS-MICE 等无子进程后端的句柄:帧由事件线程写入 frameCache
+        QMutexLocker lock(&g_mutex);
+        img = session->frameCache;
+    }
     if (img.isNull())
         return MIRROR_ERR_NOT_FOUND;
 
+    QMutexLocker lock(&g_mutex);
     session->frameCache = img;   // 持有副本,保证 data 指针有效
     frame->width  = session->frameCache.width();
     frame->height = session->frameCache.height();

@@ -53,6 +53,7 @@ typedef enum mirror_result {
 typedef enum mirror_backend {
     MIRROR_BACKEND_AIRPLAY = 0,   /* UxPlay(iOS AirPlay 接收) */
     MIRROR_BACKEND_MIRACAST = 1,  /* Miracast(安卓/笔记本) */
+    MIRROR_BACKEND_MICE = 2,      /* MS-MICE(Windows Win+K 基础设施投屏) */
 } mirror_backend_t;
 
 typedef enum mirror_state {
@@ -148,6 +149,28 @@ MIRROR_API mirror_result_t mirror_start_airplay_gateway(
 /* 停止 AirPlay 网关,销毁所有实例。 */
 MIRROR_API mirror_result_t mirror_stop_airplay_gateway(void);
 
+/*
+ * 启动 MS-MICE(Miracast over Infrastructure)接收端。
+ * 适合 Windows 发送端(Win+K 无线投屏)通过局域网/有线网络投屏:
+ *   - 发布 mDNS _display._tcp(container_id), 监听 TCP 7250 控制通道
+ *   - Windows Source 自动发现并连入, 每路 Source 独立会话
+ *   - 会话句柄经 on_client_connected 回调交付(第二个参数为 Source 名称),
+ *     帧数据用 mirror_get_frame 拉取(无后端子进程)
+ * 注意: 需先 mirror_init; 与 AirPlay 网关可同时运行(mDNS 各自广播)。
+ *
+ * @param device_name 广播设备名(可为 NULL, 默认 "MirrorCenter")
+ * @param cbs         网关回调(on_log / on_client_connected /
+ *                    on_client_disconnected, 可为 NULL)
+ * @param userdata    回调用户数据
+ */
+MIRROR_API mirror_result_t mirror_start_mice_backend(
+    const char *device_name,
+    const mirror_gateway_callbacks_t *cbs,
+    void *userdata);
+
+/* 停止 MS-MICE 接收端,销毁所有会话。 */
+MIRROR_API mirror_result_t mirror_stop_mice_backend(void);
+
 /* ---- 生命周期 ---- */
 
 /* 初始化 SDK。可调用多次,幂等。返回 MIRROR_OK 或错误码。 */
@@ -178,6 +201,30 @@ MIRROR_API mirror_result_t mirror_start_session(mirror_backend_t backend,
 
 /* 停止指定会话。 */
 MIRROR_API mirror_result_t mirror_stop_session(mirror_session_t *session);
+
+/**
+ * 启动多路 Miracast 接收组。
+ * Windows 的 Windows.Media.Miracast API 原生支持多路同时连接
+ * (MiracastReceiverSession.MaxSimultaneousConnections),单个服务进程承载 N 路
+ * 投屏连接,每路独立帧端口 + 独立会话句柄。实际并发路数受网卡驱动硬件上限
+ * (MiracastReceiverStatus.MaxSimultaneousConnections)约束,超出的连接会失败。
+ *
+ * @param count        路数(1..8)
+ * @param device_name  组显示名(可为 NULL, 默认 "Miracast")
+ * @param exe_path     MiracastReceiverService 路径(可为 NULL, SDK 自动搜索)
+ * @param out_sessions 输出会话句柄数组(容量至少 count)
+ * @param out_count    实际创建的路数
+ *
+ * 返回 MIRROR_OK 时 out_sessions[0..out_count-1] 全部有效。
+ * 停止/销毁:调用方逐个 mirror_stop_session / mirror_destroy_session。
+ * 注意:组内所有路共享同一后端服务进程,任一路断开会导致整组失效,应按组启停。
+ */
+MIRROR_API mirror_result_t mirror_start_miracast_group(
+    int count,
+    const char *device_name,
+    const char *exe_path,
+    mirror_session_t **out_sessions,
+    int *out_count);
 
 /* 停止所有会话。 */
 MIRROR_API mirror_result_t mirror_stop_all(void);

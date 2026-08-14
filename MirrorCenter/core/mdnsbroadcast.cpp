@@ -14,6 +14,7 @@ constexpr quint32 kTtlService = 4500;
 constexpr quint32 kTtlHost = 120;
 
 constexpr quint16 kTypeA = 1;
+constexpr quint16 kTypeAAAA = 28;
 constexpr quint16 kTypePTR = 12;
 constexpr quint16 kTypeTXT = 16;
 constexpr quint16 kTypeSRV = 33;
@@ -183,7 +184,25 @@ void MdnsBroadcaster::sendAnswerForService(const QString &fullName, const Servic
 void MdnsBroadcaster::buildQueryResponse(quint16 qtype, const QString &qname,
                                          QByteArray &pkt, int &anCount)
 {
-    if (qname == m_hostName) {
+    // RFC 6762:域名比较大小写不敏感。Windows 发送端解析设备名(如
+    // "MirrorCenter.local")时大小写可能与广播的 hostname 不一致,
+    // 精确比较会导致解析失败回退 Wi-Fi Direct P2P(USB 网卡易崩 GO)。
+    // 注意:主 hostname 与别名(m_hostAliases, 如电脑名)都响应 A 记录。
+    bool hostMatch = qname.compare(m_hostName, Qt::CaseInsensitive) == 0;
+    if (!hostMatch) {
+        for (const QString &alias : m_hostAliases) {
+            if (qname.compare(alias, Qt::CaseInsensitive) == 0) {
+                hostMatch = true;
+                break;
+            }
+        }
+    }
+    // 实验(2026-08-12):Windows 发送端 Win+K 连接时实际解析的是 "q.local"
+    // (WFD IE Host Name 属性广播的单字符名, 来源待查)。不响应则解析失败
+    // 回退 Wi-Fi Direct P2P → AIC 网卡 P2P 失败 → "无法连接"。
+    if (!hostMatch && qname.compare(QLatin1String("q.local"), Qt::CaseInsensitive) == 0)
+        hostMatch = true;
+    if (hostMatch) {
         if (qtype == kTypeA || qtype == kTypeANY) {
             QByteArray a;
             const quint32 ip = m_ipv4.toIPv4Address();
@@ -191,13 +210,20 @@ void MdnsBroadcaster::buildQueryResponse(quint16 qtype, const QString &qname,
             a.append(char((ip >> 16) & 0xff));
             a.append(char((ip >> 8) & 0xff));
             a.append(char(ip & 0xff));
-            appendAnswer(pkt, anCount, m_hostName, kTypeA, kTtlHost, a);
+            appendAnswer(pkt, anCount, qname, kTypeA, kTtlHost, a);
+        }
+        // Windows 发送端双栈解析 hostname 时会同时查 AAAA(TYPE28),
+        // 若 AAAA 无响应可能判定解析失败回退 P2P。有 IPv6 时补 AAAA。
+        if ((qtype == kTypeAAAA || qtype == kTypeANY) && !m_ipv6.isNull()) {
+            const quint8 *b = m_ipv6.toIPv6Address().c;
+            appendAnswer(pkt, anCount, qname, kTypeAAAA, kTtlHost,
+                         QByteArray(reinterpret_cast<const char *>(b), 16));
         }
         return;
     }
 
     // 服务发现查询:返回本机广播的所有服务类型(iOS 打开控制中心靠它枚举服务)
-    if (qname == kServicesDnsSdName) {
+    if (qname.compare(kServicesDnsSdName, Qt::CaseInsensitive) == 0) {
         const QString servicesName = kServicesDnsSdName;
         for (const Service &svc : m_services) {
             appendAnswer(pkt, anCount, servicesName, kTypePTR, kTtlService,
@@ -209,13 +235,18 @@ void MdnsBroadcaster::buildQueryResponse(quint16 qtype, const QString &qname,
     for (const Service &svc : m_services) {
         const QString fullName = serviceFullName(svc);
         const QString typeName = svc.type + ".local";
-        if (qname == typeName) {
+        if (qname.compare(typeName, Qt::CaseInsensitive) == 0) {
             // 按类型广播的 PTR 查询 → 应答该服务完整记录
             sendAnswerForService(fullName, svc, pkt, anCount, true, qtype);
-        } else if (qname == fullName) {
+        } else if (qname.compare(fullName, Qt::CaseInsensitive) == 0) {
             sendAnswerForService(fullName, svc, pkt, anCount, false, qtype);
         }
     }
+}
+
+void MdnsBroadcaster::setHostAliases(const QStringList &aliases)
+{
+    m_hostAliases = aliases;
 }
 
 void MdnsBroadcaster::onReadyRead()
@@ -239,6 +270,7 @@ void MdnsBroadcaster::onReadyRead()
         // 解析全部 question(RFC 6762: 查询包可能含多个问题, 需全部应答)
         QByteArray resp;
         int anCount = 0;
+        QStringList qnames;
         int pos = 12;
         for (int q = 0; q < qdCount; ++q) {
             QString qname;
@@ -249,7 +281,13 @@ void MdnsBroadcaster::onReadyRead()
             const quint16 qtype = (quint8(pkt[pos]) << 8) | quint8(pkt[pos + 1]);
             const quint16 qclass = (quint8(pkt[pos + 2]) << 8) | quint8(pkt[pos + 3]);
             pos += 4;
+            qnames << QStringLiteral("%1(TYPE%2)").arg(qname).arg(qtype);
             buildQueryResponse(qtype, qname, resp, anCount);
+        }
+        // 记录所有查询(含未匹配的),便于诊断 Windows 发送端解析的设备名
+        if (!qnames.isEmpty() && qnames != m_lastQueries) {
+            m_lastQueries = qnames;
+            qInfo() << "[mdns] query from" << from.toString() << ":" << qnames.join(" ");
         }
         if (anCount > 0) {
             resp = makeHeader(anCount) + resp;
@@ -284,7 +322,8 @@ void MdnsBroadcaster::announce()
 }
 
 bool MdnsBroadcaster::start(const QString &hostName, const QHostAddress &ipv4,
-                            const QList<Service> &services)
+                            const QList<Service> &services,
+                            const QHostAddress &ipv6)
 {
     stop();
 
@@ -293,6 +332,7 @@ bool MdnsBroadcaster::start(const QString &hostName, const QHostAddress &ipv4,
 
     m_hostName = hostName;
     m_ipv4 = ipv4;
+    m_ipv6 = ipv6;
     m_services = services;
 
     m_sock = new QUdpSocket(this);
@@ -317,9 +357,15 @@ bool MdnsBroadcaster::start(const QString &hostName, const QHostAddress &ipv4,
         if (iface.isValid())
             break;
     }
-    if (iface.isValid())
+    if (iface.isValid()) {
         m_sock->joinMulticastGroup(groupAddr, iface);
-    else
+        // 关键:组播出口必须固定到广播 IP 所在接口(以太网)。
+        // 否则 Windows 默认路由会把组播发到 Wi-Fi Direct GO 接口(192.168.137.1),
+        // 不同网段的发送端(如笔记本有线 10.10.0.188)收不到组播响应,
+        // 而单播响应在查询未设 QU 位时可能被 Windows mDNS 解析器忽略
+        // → hostname 解析失败 → 回退 Wi-Fi Direct P2P → AIC 网卡 P2P 失败。
+        m_sock->setMulticastInterface(iface);
+    } else
         m_sock->joinMulticastGroup(groupAddr);
     connect(m_sock, &QUdpSocket::readyRead, this, &MdnsBroadcaster::onReadyRead);
 
