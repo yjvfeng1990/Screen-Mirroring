@@ -16,7 +16,12 @@ MirrorSession *SessionManager::createSession(BackendType type,
                                              const QString &backendExe,
                                              const QStringList &backendArgs)
 {
-    const QString id = QStringLiteral("s%1").arg(m_sessions.size() + 1, 3, 10, QLatin1Char('0'));
+    // 单调递增计数生成 id:不能用 m_sessions.size()+1,
+    // 中间会话被移除后 size 会变小, 导致新会话复用已存在会话的 id,
+    // SDK 按 core->id() 分派窗口/状态回调时会匹配到错误的会话句柄,
+    // 表现即第二个投屏窗口被挂到第一个设备的视图上, UI 嵌入时卡死。
+    static quint64 s_idCounter = 0;
+    const QString id = QStringLiteral("s%1").arg(++s_idCounter, 3, 10, QLatin1Char('0'));
     auto *session = new MirrorSession(id, type, deviceName, backendExe, backendArgs, this);
     m_sessions.insert(id, session);
 

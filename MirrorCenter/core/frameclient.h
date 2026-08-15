@@ -63,6 +63,9 @@ private:
     QImage m_latestFrame;
     QSize m_videoSize;
     quint64 m_framesReceived = 0;
+    // 双缓冲:复用两块 QImage, 避免每帧 8MB(1080p BGRA)分配+释放。
+    // tryParseFrame 写到"非显示中"的 buffer, 再整体换手给 m_latestFrame(隐式共享,零拷贝)。
+    QImage m_ping, m_pong;
 };
 
 } // namespace mirror

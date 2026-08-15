@@ -1,5 +1,6 @@
 #include "mirrorsession.h"
 #include "frameclient.h"
+#include "mirror_api.h"
 
 #include <QProcess>
 #include <QProcessEnvironment>
@@ -7,7 +8,49 @@
 #include <QRegularExpression>
 #include <QDebug>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace mirror {
+
+namespace {
+// Windows Job Object:把后端子进程绑定到 MirrorCenter 进程,
+// 父进程无论正常退出还是被强杀(Stop-Process -Force), 子进程都会自动终止。
+// 否则强杀 MirrorCenter 会残留孤儿 uxplay/MiracastReceiverService,
+// 多个孤儿实例抢同一端口并同时广播同名 mDNS, 导致 AirPlay 搜索不到广播。
+
+#ifdef _WIN32
+HANDLE backendJob()
+{
+    static HANDLE job = []() {
+        HANDLE j = ::CreateJobObjectW(nullptr, nullptr);
+        if (!j)
+            return j;
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        ::SetInformationJobObject(j, JobObjectExtendedLimitInformation, &info, sizeof(info));
+        return j;
+    }();
+    return job;
+}
+
+void attachBackendToJob(QProcess *proc)
+{
+    HANDLE job = backendJob();
+    if (!job || !proc)
+        return;
+    const DWORD pid = DWORD(proc->processId());
+    if (!pid)
+        return;
+    HANDLE hProc = ::OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
+    if (!hProc)
+        return;
+    ::AssignProcessToJobObject(job, hProc);
+    ::CloseHandle(hProc);
+}
+#endif
+} // namespace
 
 MirrorSession::MirrorSession(const QString &id,
                              BackendType type,
@@ -85,6 +128,9 @@ void MirrorSession::start()
             paths << env.value(QStringLiteral("GST_PLUGIN_PATH"));
         paths << pluginDir;
         env.insert(QStringLiteral("GST_PLUGIN_PATH"), paths.join(QLatin1Char(';')));
+        // 2 分屏铺满控制文件:uxplay 轮询该文件, app 侧写 "1"/"0" 切换
+        env.insert(QStringLiteral("UXPLAY_FILL_FILE"),
+                   QString::fromUtf8(mirror_airplay_fill_file()));
         m_process->setProcessEnvironment(env);
         qInfo() << "[core] GST_PLUGIN_PATH=" << paths.join(QLatin1Char(';')).toUtf8().constData();
     }
@@ -100,6 +146,11 @@ void MirrorSession::start()
             << "args=" << m_backendArgs.join(' ').toUtf8().constData();
     m_process->start(m_backendExe, m_backendArgs);
     qInfo() << "[core] QProcess::start() returned, state=" << int(m_process->state());
+
+#ifdef _WIN32
+    // 绑定到 Job Object:父进程(含被强杀)退出时子进程自动终止, 防孤儿堆积
+    attachBackendToJob(m_process);
+#endif
 
     // Frame mode: connect to the receiver's TCP frame server.
     if (m_frameMode) {
@@ -194,6 +245,10 @@ void MirrorSession::onFrameClientReady()
 void MirrorSession::onFrameClientDisconnected()
 {
     emit logMessage(m_id, QStringLiteral("frame link lost"));
+    // 帧链路断开(投屏设备退出):回到"等待设备"状态而不是关闭会话。
+    // Miracast 多路服务进程共享, 槽位保持监听, 新设备连入同一端口即可重连
+    // (FrameClient 的 m_server 未关闭)。UI 收到 Starting 状态后清空画面/列表。
+    setState(SessionState::Starting);
 }
 
 void MirrorSession::setState(SessionState s)

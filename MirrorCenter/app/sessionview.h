@@ -6,10 +6,71 @@
 #include <QImage>
 #include <QTimer>
 #include <QPixmap>
+#include <QPainter>
 #include <QElapsedTimer>
 
 class QLabel;
 class QWindow;
+
+/**
+ * 帧显示控件:自绘 QWidget, 替代 QLabel 用于 Miracast 帧显示。
+ * QLabel::setPixmap 会触发样式表解析 + 布局 + 全量重绘, Debug 软件渲染下 1280x800
+ * 每帧耗时 50-100ms, 直接拖垮显示帧率(实测仅 6-13fps)。
+ * 这里只做"存图 + 居中绘制", 配合 WA_OpaquePaintEvent 跳过背景擦除, 重绘开销极小。
+ */
+class FrameSurface : public QWidget
+{
+    Q_OBJECT
+public:
+    explicit FrameSurface(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+        setAttribute(Qt::WA_OpaquePaintEvent);
+    }
+
+    void setFrame(const QPixmap &pm)
+    {
+        m_frame = pm;
+        update();
+    }
+    QPixmap frame() const { return m_frame; }
+    void clearFrame()
+    {
+        m_frame = QPixmap();
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QElapsedTimer dbg; dbg.start();
+        QPainter pa(this);
+        if (m_frame.isNull()) {
+            // 无帧:擦为深色背景(WA_OpaquePaintEvent 下必须显式填充, 否则残留上一帧像素)
+            pa.fillRect(rect(), QColor(18, 20, 26));
+            if (m_dbg++ % 30 == 0)
+                qInfo() << "[paint] empty";
+            return;
+        }
+        if (m_frame.size() == size()) {
+            // 铺满模式:图已按控件尺寸裁剪, 全幅绘制
+            pa.drawPixmap(0, 0, m_frame);
+        } else {
+            // 等比留边模式:先擦背景再居中绘制
+            pa.fillRect(rect(), QColor(18, 20, 26));
+            const QPoint pos((width() - m_frame.width()) / 2,
+                             (height() - m_frame.height()) / 2);
+            pa.drawPixmap(pos, m_frame);
+        }
+        if (m_dbg++ % 30 == 0)
+            qInfo() << "[paint]" << width() << "x" << height()
+                    << "=" << dbg.nsecsElapsed() / 1000 << "us";
+    }
+
+private:
+    QPixmap m_frame;
+    int m_dbg = 0;
+};
 
 // 引入 SDK C 接口
 #include "mirror_api.h"
@@ -47,7 +108,8 @@ public:
     void detach();
     /** 由 DesktopWindow 通知当前是否独占全屏(切换按钮图标) */
     void setFullscreenActive(bool active);
-    /** 由 DesktopWindow 通知当前是否单路铺满(填满窗口裁边, 而非等比留黑边) */
+    /** 由 DesktopWindow 通知当前是否铺满整格(≥2 路分屏:覆盖裁剪, 无黑边);
+     *  false = 独立等比显示完整画面(留边)。 */
     void setFillMode(bool on);
     /** 更新来源手机名称/型号(显示在悬浮标签) */
     void setClientInfo(const QString &name, const QString &model);
@@ -65,6 +127,8 @@ signals:
     void thumbnailUpdated();
     /** 收到首帧(自建会话真正出画, 此时才允许主窗口/列表显示) */
     void firstFrameReceived();
+    /** 帧链路断开(设备退出):画面已清空, 回到等待状态(通知主窗口重排/刷新列表) */
+    void firstFrameCleared();
 
 protected:
     void moveEvent(QMoveEvent *e) override;
@@ -81,6 +145,11 @@ private:
     void attachWindow(qulonglong wid);
     void setStatus(const QString &s);
     void renderFrame();
+    /**
+     * 检测横屏帧内左右黑边(安卓 Miracast 流恒横屏, 竖屏内容在帧内居中带左右黑边)。
+     * 检测到且内容区为竖屏返回内容矩形; 无黑边/内容非竖屏返回整帧。
+     */
+    QRect detectSideBars(const QImage &img);
     /** 周期查询 Wifi 网卡性能计数器, 差分显示源网络实时接收/发送速率 */
     void queryNetRate();
     /** 抓取当前画面(平台相关实现) */
@@ -108,13 +177,16 @@ private:
     bool m_gatewayMode = false;      // 句柄由网关提供, stop() 不销毁
 
     QPointer<QWindow> m_childWindow;
+    qulonglong m_embeddedHwnd = 0;       // 已嵌入的原生窗口句柄(去重 + 重挂防抖)
     QWidget *m_videoArea      = nullptr;   // 视频区(占位/嵌入容器/Miracast 帧)
     QWidget *m_infoBadge      = nullptr;   // 悬浮信息标签(独立顶层窗, 设备名 + 状态)
     QLabel  *m_statusDot      = nullptr;   // 状态指示点
     QLabel  *m_statusLabel    = nullptr;   // 状态文字
-    QLabel  *m_rateLabel      = nullptr;   // 数据传输率/帧率(接收端信息栏)
+    QLabel  *m_resLabel       = nullptr;   // 分辨率(仅一处显示, 避免与状态重复)
+    QLabel  *m_fpsLabel       = nullptr;   // 帧率
+    QLabel  *m_rateLabel      = nullptr;   // 上下行数据传输率
     QLabel  *m_devLabel       = nullptr;   // 来源手机名称(初始为 IP)
-    QLabel  *m_videoLabel     = nullptr;   // Miracast 帧显示
+    FrameSurface *m_videoLabel  = nullptr;  // Miracast 帧显示(自绘, 无 QLabel 重绘开销)
     class QToolButton *m_muteBtn = nullptr; // 静音切换
     class QToolButton *m_fullBtn = nullptr; // 全屏切换
     bool m_muted            = false;
@@ -133,5 +205,7 @@ private:
     QProcess *m_netProc = nullptr;       // 正在执行的查询进程
     bool m_framePending = false;         // 上一帧是否还没在 UI 线程渲染完(节流用)
     bool m_hasFirstFrame = false;        // 是否已收到首帧(Miracast 占位会话据此隐藏)
-    bool m_fillMode = false;             // 单路铺满:视频填满整格(居中裁剪), 否则等比留边
+    bool m_fillMode = false;             // 铺满整格:等比放大覆盖后居中裁剪(无黑边)
+    qint64 m_lastBarCheck = 0;           // 黑边检测节流时间戳(ms)
+    QRect  m_lastBarRect;                // 最近一次黑边检测结果(整帧=无竖屏黑边)
 };

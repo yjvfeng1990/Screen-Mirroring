@@ -587,7 +587,9 @@ MIRROR_API mirror_result_t mirror_start_airplay_gateway(
                          ? QString::fromUtf8(exe_path)
                          : g_manager->findBackendExe({QStringLiteral("uxplay.exe"),
                                                       QStringLiteral("uxplay")});
-    // 与单会话模式一致:默认 d3d11videosink 输出(窗口嵌入依赖)
+    // 与单会话模式一致:默认 d3d11videosink 输出(窗口嵌入依赖)。
+    // 不追加 videosink_options:uxplay 会默认补 force-aspect-ratio=TRUE,
+    // 每个格子独立等比显示完整画面(留边不裁切), 保证横竖屏都完整可见。
     cfg.extraArgs << QStringLiteral("-vs") << QStringLiteral("d3d11videosink");
 
     mirror_gateway_callbacks_t cbsCopy{};
@@ -633,6 +635,13 @@ MIRROR_API mirror_result_t mirror_stop_airplay_gateway(void)
     stopGatewayAndCleanHandles();
     setError("ok");
     return MIRROR_OK;
+}
+
+MIRROR_API const char *mirror_airplay_fill_file(void)
+{
+    static const QByteArray path =
+        QDir::temp().filePath(QStringLiteral("mirrorcenter_uxplay_fill.txt")).toUtf8();
+    return path.constData();
 }
 
 MIRROR_API mirror_result_t mirror_start_mice_backend(

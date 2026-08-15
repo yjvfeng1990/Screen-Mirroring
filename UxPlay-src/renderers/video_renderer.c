@@ -95,6 +95,8 @@ struct video_renderer_s {
     gboolean eos;
     gint64 duration;
     gint buffering_level;
+    GstElement *crop;      /* 2 分屏铺满:动态 cover 裁切(videocrop), 无则 NULL */
+    GstElement *sink;      /* 视频 sink 元素(动态切换 force-aspect-ratio 用) */
 #ifdef  X_DISPLAY_FIX
     bool use_x11;
     const char * server_name;
@@ -115,6 +117,12 @@ static char jpeg[] = "jpeg";
  * the window is adjusted from the main loop to avoid racing the renderer). */
 static int g_video_ratio_w = 0;
 static int g_video_ratio_h = 0;
+
+/* 2 分屏铺满模式(由 MirrorCenter 通过控制文件下发):
+ * 开启后竖屏视频 cover 裁切铺满竖格, 横屏视频保持比例。 */
+static gboolean fill_mode = FALSE;
+static gboolean have_crop_plugin = FALSE;
+static char *fill_file = NULL;    /* UXPLAY_FILL_FILE: 内容 "1"/"0" 切换铺满 */
 
 /* Find this process's d3d11videosink render window (its title contains
  * "Direct3D11").  Only windows created by this process are considered:
@@ -178,8 +186,91 @@ static void adjust_window_to_video_ratio (int vw, int vh) {
              vw, vh, cur_w, cur_h, (int) (new_w + 0.5), (int) (new_h + 0.5));
 }
 
+/* 2 分屏铺满:读取 MirrorCenter 下发的控制文件。
+ * 规则与 Qt 侧(Miracast)完全一致, 只看视频方向、与格子方向无关:
+ * 竖屏视频 cover 裁切铺满(无黑边); 横屏视频保持原比例(完整可见)。
+ * 实现只动 videocrop: sink 固定 force-aspect-ratio=TRUE(裁到窗口比例后恰好铺满),
+ * 绝不在播放中切换 force-aspect-ratio —— 那会触发 d3d11 窗口重建,
+ * 与 Qt 侧嵌入窗口竞争消息, 是 2 分屏时 UI 卡死的根源之一。 */
+static void apply_fill_mode (void) {
+    if (!fill_file) {
+        fill_mode = FALSE;
+        return;
+    }
+    gboolean want = FALSE;
+    FILE *f = fopen (fill_file, "r");
+    if (f) {
+        char buf[8] = {0};
+        if (fgets (buf, sizeof (buf), f) && atoi (buf) > 0)
+            want = TRUE;
+        fclose (f);
+    }
+    fill_mode = want;
+
+    /* 窗口句柄/客户区缓存: 每 1s 才重新 EnumWindows/GetClientRect 一次,
+     * 避免 50ms 高频窗口枚举消息与 Qt 侧嵌入(SetParent)互相等待卡死 UI。 */
+    static HWND cached_hwnd = NULL;
+    static int cached_w = 0, cached_h = 0;
+    static gint64 last_win_scan = 0;
+    gint64 now = g_get_monotonic_time ();
+    int W = cached_w, H = cached_h;
+    if (!cached_hwnd || !IsWindow (cached_hwnd) || now - last_win_scan > G_USEC_PER_SEC) {
+        HWND hwnd = NULL;
+        EnumWindows (find_d3d11_window_enum, (LPARAM) &hwnd);
+        cached_hwnd = hwnd;
+        last_win_scan = now;
+        W = 0; H = 0;
+        if (hwnd) {
+            RECT cr;
+            if (GetClientRect (hwnd, &cr)) {
+                W = cr.right - cr.left;
+                H = cr.bottom - cr.top;
+            }
+        }
+        cached_w = W; cached_h = H;
+    }
+
+    int vw = g_video_ratio_w, vh = g_video_ratio_h;
+    gboolean cover = FALSE;
+    gint top = 0, bottom = 0, left = 0, right = 0;
+    /* 只看视频方向:竖屏视频在任意格子(横/竖)都裁切铺满;横屏视频不裁切。
+     * 与 Qt 侧 Miracast 的 fill = m_fillMode && videoPortrait 保持一致。 */
+    if (fill_mode && vw > 0 && vh > 0 && W > 0 && H > 0 && vh > vw) {
+        double target = (double) W / (double) H;
+        double cur = (double) vw / (double) vh;
+        cover = TRUE;
+        if (cur < target - 0.005) {          /* 视频更竖:裁高 */
+            int crop_h = vh - (int) ((double) vw / target);
+            if (crop_h > 0) { top = crop_h / 2; bottom = crop_h - top; }
+        } else if (cur > target + 0.005) {   /* 视频更横:裁宽 */
+            int crop_w = vw - (int) ((double) vh * target);
+            if (crop_w > 0) { left = crop_w / 2; right = crop_w - left; }
+        }
+    }
+    /* 无变化则跳过, 避免 50ms 轮询反复触发 GStreamer 重协商 */
+    static gboolean last_cover = FALSE;
+    static gint last_top = 0, last_bottom = 0, last_left = 0, last_right = 0;
+    if (cover == last_cover && top == last_top && bottom == last_bottom
+        && left == last_left && right == last_right)
+        return;
+    last_cover = cover; last_top = top; last_bottom = bottom;
+    last_left = left; last_right = right;
+
+    for (int i = 0; i < n_renderers; i++) {
+        if (!renderer_type[i])
+            continue;
+        if (renderer_type[i]->crop) {
+            g_object_set (renderer_type[i]->crop, "left", cover ? left : 0,
+                          "right", cover ? right : 0, "top", cover ? top : 0,
+                          "bottom", cover ? bottom : 0, NULL);
+        }
+    }
+}
+
 static gboolean adjust_window_timer_cb (gpointer user_data) {
-    if (g_video_ratio_w > 0 && g_video_ratio_h > 0) {
+    apply_fill_mode ();
+    /* 铺满模式下保持窗口为格子尺寸(不随视频比例调整), 否则按视频比例调整 */
+    if (!fill_mode && g_video_ratio_w > 0 && g_video_ratio_h > 0) {
         adjust_window_to_video_ratio (g_video_ratio_w, g_video_ratio_h);
     }
     /* The d3d11videosink window is only created when the first frame is
@@ -427,6 +518,17 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
 
     logger = render_logger;
     logger_debug = (logger_get_level(logger) >= LOGGER_DEBUG);
+#ifdef WIN32
+    /* 2 分屏铺满:读 MirrorCenter 下发的控制文件路径(env UXPLAY_FILL_FILE),
+     * 并确认 videocrop 插件可用(不可用则退化为不裁切)。 */
+    fill_file = g_strdup (g_getenv ("UXPLAY_FILL_FILE"));
+    if (fill_file)
+        logger_log (logger, LOGGER_INFO, "2-split fill control file: %s", fill_file);
+    GstElementFactory *crop_factory = gst_element_factory_find ("videocrop");
+    have_crop_plugin = (crop_factory != NULL);
+    if (crop_factory)
+        gst_object_unref (crop_factory);
+#endif
     hls_seek_enabled = FALSE;
     hls_playing = FALSE;
     hls_seek_start = -1;
@@ -545,6 +647,14 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
                     g_string_append(launch, " ! imagefreeze allow-replace=TRUE ! textoverlay name=metadata_overlay ! ");
                 } else {
                     g_string_append(launch, " ! queue ! ");
+#ifdef WIN32
+                    /* 2 分屏铺满:在 sink 前插入 videocrop(默认不裁切, 铺满时动态设值) */
+                    if (have_crop_plugin) {
+                        g_string_append(launch, "videocrop name=cover_crop_");
+                        g_string_append(launch, renderer_type[i]->codec);
+                        g_string_append(launch, " ! ");
+                    }
+#endif
                 }
                 g_string_append(launch, videosink);
                 g_string_append(launch, " name=");
@@ -595,10 +705,19 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
                         g_signal_connect (sink_pad, "notify::caps", G_CALLBACK (on_video_sink_caps), renderer_type[i]->pipeline);
                         gst_object_unref (sink_pad);
                     }
-                    gst_object_unref (sink_elem);
+                    /* 保留 sink 引用:2 分屏铺满时动态切换 force-aspect-ratio */
+                    renderer_type[i]->sink = sink_elem;
                 }
                 g_free (sink_name);
             }
+#ifdef WIN32
+            /* 2 分屏铺满:记录 videocrop 元素(默认不裁切, 铺满时动态设值) */
+            if (have_crop_plugin && !jpeg_pipeline) {
+                gchar *crop_name = g_strdup_printf("cover_crop_%s", renderer_type[i]->codec);
+                renderer_type[i]->crop = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), crop_name);
+                g_free (crop_name);
+            }
+#endif
             GstClock *clock = gst_system_clock_obtain();
             g_object_set(clock, "clock-type", GST_CLOCK_TYPE_REALTIME, NULL);
             gst_pipeline_use_clock(GST_PIPELINE_CAST(renderer_type[i]->pipeline), clock);

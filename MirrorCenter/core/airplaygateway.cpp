@@ -40,6 +40,9 @@ QString AirPlayGateway::findLocalIpv4() const
     // 多网卡环境下必须选 iPhone 实际可达的网卡:
     // 1) 优先无线网卡(WLAN/Wi-Fi/Wireless), iOS AirPlay 必然走 Wi-Fi;
     // 2) 否则退回第一个可用 IPv4。
+    // 3) 必须排除 Wi-Fi Direct GO 虚拟接口(名字含 "Direct" 或 192.168.137.0/24
+    //    网段)。Miracast 接收时系统会创建 GO 接口(192.168.137.1), 它只是投屏
+    //    P2P 网段, 广播到该接口 iPhone 永远收不到(实测 AirPlay 搜不到广播的根因)。
     const auto ifaces = QNetworkInterface::allInterfaces();
     QString fallback;
 
@@ -51,6 +54,18 @@ QString AirPlayGateway::findLocalIpv4() const
             || n.contains(QStringLiteral("Wireless LAN"), Qt::CaseInsensitive)
             || n.contains(QStringLiteral("无线"), Qt::CaseInsensitive);
     };
+    auto isDirectGo = [](const QNetworkInterface &i) {
+        if (i.name().contains(QStringLiteral("Direct"), Qt::CaseInsensitive))
+            return true;
+        const auto entries = i.addressEntries();
+        for (const QNetworkAddressEntry &e : entries) {
+            const quint32 ip = e.ip().toIPv4Address();
+            // Windows 移动热点 / Wi-Fi Direct GO 默认网段 192.168.137.0/24
+            if ((ip & 0xffffff00u) == 0xc0a88900u)   // 192.168.137.x
+                return true;
+        }
+        return false;
+    };
 
     for (const QNetworkInterface &iface : ifaces) {
         if (!(iface.flags() & QNetworkInterface::IsUp) ||
@@ -58,6 +73,8 @@ QString AirPlayGateway::findLocalIpv4() const
             continue;
         if (iface.name().contains(QStringLiteral("vEthernet"), Qt::CaseInsensitive))
             continue;
+        if (isDirectGo(iface))
+            continue;   // Wi-Fi Direct GO 投屏网段, 不作为 AirPlay 广播接口
         const auto entries = iface.addressEntries();
         for (const QNetworkAddressEntry &e : entries) {
             if (e.ip().protocol() != QAbstractSocket::IPv4Protocol ||
@@ -375,7 +392,7 @@ void AirPlayGateway::maybeStartMdns()
                 routeConnection(sock);
         });
     }
-    if (!m_server->isListening() && !m_server->listen(QHostAddress::Any, m_cfg.gatewayPort)) {
+    if (!m_server->isListening() && !m_server->listen(QHostAddress::AnyIPv4, m_cfg.gatewayPort)) {
         emit logMessage(QStringLiteral("[gateway] 监听 %1 失败: %2")
                             .arg(m_cfg.gatewayPort).arg(m_server->errorString()));
         return;
@@ -474,6 +491,15 @@ void AirPlayGateway::routeConnection(QTcpSocket *sock)
     QString ip = peer.toString();
     if (peer.protocol() == QAbstractSocket::IPv6Protocol && ip.startsWith(QLatin1String("::ffff:")))
         ip = QHostAddress(peer.toIPv4Address()).toString();
+    // AirPlay 视频链路(mirror data/控制通道)仅支持 IPv4:若设备经 IPv6 连入,
+    // 视频数据流无法送达 uxplay 的 IPv4-only 监听端口, 表现为"无图像"。
+    // 直接拒绝(abort→RST), 让 iOS 的 Happy Eyeballs 回退到 IPv4 重连。
+    if (peer.protocol() == QAbstractSocket::IPv6Protocol) {
+        emit logMessage(QStringLiteral("[gateway] 拒绝 IPv6 连接 %1 (AirPlay 视频链路仅支持 IPv4)").arg(ip));
+        sock->abort();
+        sock->deleteLater();
+        return;
+    }
 
     Instance *inst = nullptr;
     if (m_clientMap.contains(ip)) {

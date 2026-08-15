@@ -140,26 +140,39 @@ bool FrameClient::tryParseFrame()
     // ARGB32_Premultiplied 解释导致整体花屏/透明)。
     const uchar *payload = reinterpret_cast<const uchar *>(
         m_buffer.constData() + kHeaderSize);
-    QImage img;
+    // 双缓冲:挑一块"当前未显示"的 QImage 复用(尺寸不变时零分配)。
+    // m_latestFrame 可能正被 UI 线程引用(隐式共享), 不能原地写它。
+    QImage *back = (m_ping.constBits() == m_latestFrame.constBits()) ? &m_pong : &m_ping;
+    if (back->size() != QSize(m_width, m_height)) {
+        // 分辨率变化才重建(帧来源切换/投屏端改分辨率)
+        back->operator=(QImage(m_width, m_height, QImage::Format_RGB32));
+    }
     if (m_stride == 0) {
-        img.loadFromData(payload, m_payloadSize);
+        // JPEG 压缩帧:解到复用 buffer
+        QImage dec;
+        if (dec.loadFromData(payload, m_payloadSize)) {
+            *back = dec;
+        } else {
+            m_buffer.remove(0, kHeaderSize + m_payloadSize);
+            m_headerParsed = false;
+            return true;
+        }
     } else {
-        img = QImage(m_width, m_height, QImage::Format_RGB32);
-        const int dstStride = img.bytesPerLine();
+        const int dstStride = back->bytesPerLine();
         const uchar *src = payload;
-        uchar *dst = img.bits();
+        uchar *dst = back->bits();
         const int copyBytes = qMin(m_stride, dstStride);
         for (int y = 0; y < m_height; ++y) {
             memcpy(dst + y * dstStride, src + y * m_stride, copyBytes);
         }
     }
-    if (img.isNull()) {
+    if (back->isNull()) {
         // 解码失败:丢弃这一帧,继续等下一帧(避免坏帧卡住链路)
         m_buffer.remove(0, kHeaderSize + m_payloadSize);
         m_headerParsed = false;
         return true;
     }
-    m_latestFrame = img;
+    m_latestFrame = *back;   // 隐式共享换手,零拷贝
     m_videoSize = QSize(m_width, m_height);
 
     // 移除已消费数据

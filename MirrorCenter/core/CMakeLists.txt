@@ -24,6 +24,7 @@ add_library(mirrorcore STATIC
 
 target_include_directories(mirrorcore PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/sdk
 )
 
 target_link_libraries(mirrorcore PUBLIC Qt6::Core Qt6::Network Qt6::Gui)

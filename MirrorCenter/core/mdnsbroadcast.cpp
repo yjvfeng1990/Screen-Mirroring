@@ -212,13 +212,10 @@ void MdnsBroadcaster::buildQueryResponse(quint16 qtype, const QString &qname,
             a.append(char(ip & 0xff));
             appendAnswer(pkt, anCount, qname, kTypeA, kTtlHost, a);
         }
-        // Windows 发送端双栈解析 hostname 时会同时查 AAAA(TYPE28),
-        // 若 AAAA 无响应可能判定解析失败回退 P2P。有 IPv6 时补 AAAA。
-        if ((qtype == kTypeAAAA || qtype == kTypeANY) && !m_ipv6.isNull()) {
-            const quint8 *b = m_ipv6.toIPv6Address().c;
-            appendAnswer(pkt, anCount, qname, kTypeAAAA, kTtlHost,
-                         QByteArray(reinterpret_cast<const char *>(b), 16));
-        }
+        // 不再回 AAAA: iOS 设备查 hostname 时若拿到 IPv6 记录会优先走 IPv6
+        // (RFC 6724), 而 AirPlay 视频链路(mirror data)仅监听 IPv4, 导致
+        // 视频数据无法送达 → "投屏无图像"。只回 A 记录, iOS 自然回退 IPv4。
+        // (2026-08-15 实测: 删除 AAAA 后 iPad/iPhone 均经 IPv4 正常出图)
         return;
     }
 

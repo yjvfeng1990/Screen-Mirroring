@@ -90,10 +90,8 @@ void SessionView::buildUi()
     layout->addWidget(m_videoArea, 0, 0);
 
     if (m_backend == MIRROR_BACKEND_MIRACAST) {
-        // Miracast 帧模式:用 QLabel 显示最新帧(铺满整格)
-        m_videoLabel = new QLabel(this);
-        m_videoLabel->setAlignment(Qt::AlignCenter);
-        m_videoLabel->setScaledContents(false);
+        // Miracast 帧模式:用自绘控件显示最新帧(铺满整格)
+        m_videoLabel = new FrameSurface(this);
         layout->removeWidget(m_videoArea);
         m_videoArea->deleteLater();
         m_videoArea = nullptr;
@@ -123,6 +121,12 @@ void SessionView::buildUi()
     m_rateLabel = new QLabel(QStringLiteral("0 Mbps"), m_infoBadge);
     m_rateLabel->setStyleSheet("background-color:transparent;");
 
+    // 分辨率/帧率独立标签:排列 名称 · 状态 · 分辨率 · 帧率 · 上下行速率
+    m_resLabel = new QLabel(QStringLiteral("--"), m_infoBadge);
+    m_resLabel->setStyleSheet("background-color:transparent;");
+    m_fpsLabel = new QLabel(QStringLiteral("--"), m_infoBadge);
+    m_fpsLabel->setStyleSheet("background-color:transparent;");
+
     m_devLabel = new QLabel(m_deviceName, m_infoBadge);
     m_devLabel->setStyleSheet("background-color:transparent;");
 
@@ -132,6 +136,8 @@ void SessionView::buildUi()
     badgeL->addWidget(m_devLabel);
     badgeL->addWidget(m_statusDot);
     badgeL->addWidget(m_statusLabel);
+    badgeL->addWidget(m_resLabel);
+    badgeL->addWidget(m_fpsLabel);
     badgeL->addWidget(m_rateLabel);
 
     // 静音 / 全屏按钮
@@ -279,7 +285,7 @@ void SessionView::detach()
         }
         m_childWindow = nullptr;
     }
-    // 恢复占位提示区
+    m_embeddedHwnd = 0;
     if (m_videoArea && m_videoArea->parent() != this) {
         if (auto *g = qobject_cast<QGridLayout *>(this->layout()))
             g->addWidget(m_videoArea, 0, 0);
@@ -298,15 +304,29 @@ void SessionView::onStateCallback(mirror_session_t *session, mirror_state_t stat
     auto *self = static_cast<SessionView *>(userdata);
     if (!self)
         return;
-    const QString text = (state == MIRROR_STATE_FAILED)
-                             ? QStringLiteral("启动失败")
-                             : (state == MIRROR_STATE_CLOSED)
-                                   ? QStringLiteral("已关闭")
-                                   : QStringLiteral("状态 %1").arg(int(state));
-    QMetaObject::invokeMethod(self, [self, text]() {
+    QString text;
+    if (state == MIRROR_STATE_FAILED)
+        text = QStringLiteral("启动失败");
+    else if (state == MIRROR_STATE_CLOSED)
+        text = QStringLiteral("已关闭");
+    else if (state == MIRROR_STATE_STARTING)
+        text = QStringLiteral("等待设备投屏连接……");
+    else
+        text = QStringLiteral("状态 %1").arg(int(state));
+    QMetaObject::invokeMethod(self, [self, text, state]() {
         self->setStatus(text);
-        if (text == QStringLiteral("已关闭"))
+        if (state == MIRROR_STATE_STARTING) {
+            // 帧链路断开(投屏设备退出):清空画面与活跃标记, 回到占位等待。
+            // 会话保留(多路 Miracast 服务进程共享), 新设备连入后帧回调重新出画。
+            if (self->m_videoLabel)
+                self->m_videoLabel->clearFrame();
+            self->m_hasFirstFrame = false;
+            self->m_lastThumb = QPixmap();
+            emit self->firstFrameCleared();
+            self->updateInfoBadge();   // 无内容了:悬浮窗随之隐藏
+        } else if (state == MIRROR_STATE_CLOSED) {
             emit self->sessionClosed(self->m_sessionId);
+        }
     }, Qt::QueuedConnection);
     Q_UNUSED(session)
 }
@@ -341,6 +361,7 @@ void SessionView::onFrameCallback(mirror_session_t *session, void *userdata)
     self->m_framePending = true;
     QMetaObject::invokeMethod(self, [self]() {
         self->renderFrame();
+        self->m_framePending = false;   // 渲染完成才解锁, 防止排队帧堆积
     }, Qt::QueuedConnection);
     Q_UNUSED(session)
 }
@@ -410,7 +431,7 @@ QImage SessionView::captureThumbnail()
 #endif
     // Miracast:帧模式,直接取最近显示的画面
     if (m_videoLabel) {
-        QPixmap p = m_videoLabel->pixmap();
+        QPixmap p = m_videoLabel->frame();
         if (!p.isNull())
             return p.toImage();
     }
@@ -450,10 +471,44 @@ void SessionView::setFillMode(bool on)
     m_fillMode = on;
 }
 
+QRect SessionView::detectSideBars(const QImage &img)
+{
+    const int w = img.width(), h = img.height();
+    if (w <= 0 || h <= 0 || img.format() != QImage::Format_RGB32)
+        return QRect(0, 0, w, h);
+    // 取 4 条水平采样线(避开顶部/底部可能的状态/控制区)
+    const int rows[4] = { h * 3 / 16, h * 5 / 16, h * 11 / 16, h * 13 / 16 };
+    const int step = 8;     // 列采样步长
+    const int darkTh = 24;  // 亮度阈值(0-255), 平均低于此视为黑边
+    auto colDark = [&](int x) {
+        int sum = 0;
+        for (int i = 0; i < 4; ++i) {
+            const uchar *p = img.constScanLine(rows[i]) + x * 4;  // BGRA
+            sum += (p[2] + p[1] + p[0]) / 3;
+        }
+        return sum / 4 < darkTh;
+    };
+    // 从左往右找内容左边界
+    int left = 0;
+    for (int x = 0; x < w; x += step) {
+        if (!colDark(x)) { left = x; break; }
+        left = x;
+    }
+    // 从右往左找内容右边界
+    int right = w - 1;
+    for (int x = w - 1; x >= 0; x -= step) {
+        if (!colDark(x)) { right = x; break; }
+        right = x;
+    }
+    const int cw = right - left + 1;
+    // 黑边合计不足 1/8 宽度, 或内容区不高于宽(非竖屏内容), 视为无竖屏黑边 → 返回整帧
+    if (cw <= 0 || cw >= w - w / 8 || cw >= h)
+        return QRect(0, 0, w, h);
+    return QRect(left, 0, cw, h);
+}
+
 void SessionView::renderFrame()
 {
-    // 允许下一个帧回调排队(节流:UI 渲染期间丢弃新帧)
-    m_framePending = false;
     if (!m_sdkSession || !m_videoLabel)
         return;
     mirror_frame_t frame;
@@ -462,49 +517,95 @@ void SessionView::renderFrame()
         return;
     }
 
-    // data 仅在调用期间有效:先拷贝成 QImage
-    QImage img(frame.width, frame.height, QImage::Format_RGB32);
-    const int copyBytes = qMin(frame.stride, img.bytesPerLine());
-    for (int y = 0; y < frame.height; ++y) {
-        memcpy(img.scanLine(y),
-               frame.data + static_cast<qint64>(y) * frame.stride,
-               copyBytes);
+    // stride 与宽度对齐(RGB32 每行 4 字节)时零拷贝包装, 避免 8MB 逐行 memcpy;
+    // frame.data 在本次调用期间有效, scaled 同步完成, 输出为独立 buffer, 安全。
+    QImage img;
+    if (frame.stride == frame.width * 4) {
+        img = QImage(frame.data, frame.width, frame.height, frame.stride,
+                     QImage::Format_RGB32);
+    } else {
+        img = QImage(frame.width, frame.height, QImage::Format_RGB32);
+        const int copyBytes = qMin(frame.stride, img.bytesPerLine());
+        for (int y = 0; y < frame.height; ++y) {
+            memcpy(img.scanLine(y),
+                   frame.data + static_cast<qint64>(y) * frame.stride,
+                   copyBytes);
+        }
     }
-    // 铺满模式:等比放大到覆盖整个目标区后居中裁剪(无黑边, 不变形);
-    // 否则等比缩放到区域内(保留黑边)。
-    static auto scaledToCover = [](const QImage &src, const QSize &target) {
+    // 铺满仅用于 2 分屏:竖屏视频铺满格子, 横屏视频保持原比例(完整可见);
+    // 其它分屏(1 屏/3 屏以上)一律保持原比例。只看视频方向, 与格子方向无关。
+    // 安卓 Miracast 流恒横屏(如 1920x1080), 竖屏内容在帧内居中带左右黑边,
+    // 通过 detectSideBars 裁出竖屏内容区后同样铺满; 真横屏内容不变。
+    // 铺满采用"高度优先":高度 100% 显示(内容不裁切), 宽度超出才裁左右,
+    // 不足则居中留深色边 —— 避免竖屏视频上下被裁掉一截。
+    static auto scaledToFillHeight = [](const QImage &src, const QSize &target) {
         if (target.isEmpty())
             return src;
-        const double s = qMax(double(target.width()) / src.width(),
-                              double(target.height()) / src.height());
-        const QSize sz(qMax(1, qRound(src.width() * s)), qMax(1, qRound(src.height() * s)));
+        const double s = double(target.height()) / src.height();
+        const QSize sz(qMax(1, qRound(src.width() * s)), target.height());
         const QImage big = src.scaled(sz, Qt::KeepAspectRatio, Qt::FastTransformation);
-        const int dx = (big.width() - target.width()) / 2;
-        const int dy = (big.height() - target.height()) / 2;
-        return big.copy(dx, dy, target.width(), target.height());
+        if (big.width() >= target.width()) {
+            const int dx = (big.width() - target.width()) / 2;
+            return big.copy(dx, 0, target.width(), target.height());
+        }
+        // 宽度不足:居中显示, 左右深色留边
+        QImage canvas(target, QImage::Format_RGB32);
+        canvas.fill(QColor(18, 20, 26));
+        QPainter pa(&canvas);
+        pa.drawImage((target.width() - big.width()) / 2, 0, big);
+        return canvas;
     };
-    const QImage scaledImg = m_fillMode
-        ? scaledToCover(img, m_videoLabel->size())
-        : img.scaled(m_videoLabel->size(), Qt::KeepAspectRatio, Qt::FastTransformation);
-    m_videoLabel->setPixmap(QPixmap::fromImage(scaledImg));
-    setStatus(QStringLiteral("接收中 %1x%2").arg(frame.width).arg(frame.height));
+    const bool framePortrait = frame.height > frame.width;
+    // 横屏帧:2 分屏下节流检测左右黑边(竖屏内容), 检测到则铺满前先裁黑边
+    QRect barRect(0, 0, frame.width, frame.height);
+    if (m_fillMode && !framePortrait) {
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (now - m_lastBarCheck > 300 || m_lastBarRect.width() != frame.width
+            || m_lastBarRect.height() != frame.height) {
+            m_lastBarCheck = now;
+            m_lastBarRect = detectSideBars(img);
+            if (m_lastBarRect.width() != frame.width)
+                qInfo() << "[bar] 2 分屏检测到竖屏内容区"
+                        << m_lastBarRect.width() << "x" << m_lastBarRect.height()
+                        << "in" << frame.width << "x" << frame.height;
+        }
+        barRect = m_lastBarRect;
+    }
+    // 内容为竖屏(帧本身竖屏, 或横屏帧内裁出的内容区竖屏)才铺满
+    const bool contentPortrait = framePortrait || barRect.width() < barRect.height();
+    const bool fill = m_fillMode && contentPortrait;
+    const bool hasCrop = barRect != QRect(0, 0, frame.width, frame.height);
+    const QImage src = (fill && hasCrop) ? img.copy(barRect) : img;
+    const QImage scaledImg = fill
+        ? scaledToFillHeight(src, m_videoLabel->size())
+        : src.scaled(m_videoLabel->size(), Qt::KeepAspectRatio, Qt::FastTransformation);
+    m_videoLabel->setFrame(QPixmap::fromImage(scaledImg));
+    // 分辨率只在速率栏显示(↓↑ Mbps · fps · WxH), 状态文字不重复带
+    setStatus(QStringLiteral("接收中"));
 
     // 首帧:占位会话真正出画, 通知主窗口/列表开始显示
     if (!m_hasFirstFrame) {
         m_hasFirstFrame = true;
         emit firstFrameReceived();
+        updateInfoBadge();   // 有内容了:悬浮窗随之显示并贴紧视图
     }
 
-    // 帧率/分辨率统计(1s 窗口):附带显示在无线链路速率旁
+    // 帧率/分辨率统计(1s 窗口):分辨率变化时更新标签, 帧率每秒更新
     ++m_rateFrames;
-    m_lastW = frame.width;
-    m_lastH = frame.height;
+    if (m_lastW != frame.width || m_lastH != frame.height) {
+        m_lastW = frame.width;
+        m_lastH = frame.height;
+        if (m_resLabel)
+            m_resLabel->setText(QStringLiteral("%1×%2").arg(m_lastW).arg(m_lastH));
+    }
     if (!m_rateTimer.isValid()) {
         m_rateTimer.start();
     } else if (m_rateTimer.elapsed() >= 1000) {
         m_lastFps = m_rateFrames;
         m_rateFrames = 0;
         m_rateTimer.restart();
+        if (m_fpsLabel)
+            m_fpsLabel->setText(QStringLiteral("%1fps").arg(m_lastFps));
         // 显示帧率打点(供日志核对解码/渲染是否吃得住)
         qInfo() << "[fps]" << m_lastFps << "fps"
                 << frame.width << "x" << frame.height;
@@ -547,22 +648,22 @@ void SessionView::queryNetRate()
         const double rxMbps = rxBps * 8.0 / 1e6;
         const double txMbps = txBps * 8.0 / 1e6;
 
-        // 显示:↓接收 ↑发送 Mbps + 帧率 + 分辨率
-        QString s = QStringLiteral("↓%1 ↑%2 Mbps")
-                        .arg(rxMbps, 0, 'f', 1)
-                        .arg(txMbps, 0, 'f', 1);
-        if (m_lastFps > 0)
-            s += QStringLiteral(" · %1fps · %2×%3")
-                     .arg(m_lastFps).arg(m_lastW).arg(m_lastH);
-        m_rateLabel->setText(s);
+        // 只显示上下行速率(分辨率/帧率由独立标签在 renderFrame 更新)
+        m_rateLabel->setText(QStringLiteral("↓%1 ↑%2 Mbps")
+                                 .arg(rxMbps, 0, 'f', 1)
+                                 .arg(txMbps, 0, 'f', 1));
     });
 
     m_netProc->start(
         QStringLiteral("powershell"),
         {QStringLiteral("-NoProfile"), QStringLiteral("-Command"),
-         QStringLiteral("Get-Counter '\\Network Interface(*)\\Bytes Received/sec','\\Network Interface(*)\\Bytes Sent/sec' -ErrorAction Stop | "
-                        "ForEach-Object {$_.CounterSamples | Where-Object {$_.InstanceName -match 'Wifi|WLAN'} | "
-                        "ForEach-Object {if($_.Path -match 'Received'){'R='+[math]::Round($_.CookedValue)}else{'S='+[math]::Round($_.CookedValue)}}}")});
+         // 全接口求和:网卡实例名不可枚举——LAN 走以太网(i219-v), 安卓 Miracast 走
+         // Wi-Fi Direct 虚拟网卡, 旧过滤 'Wifi|WLAN' 一个都匹配不到导致安卓看不到码率。
+         // 投屏视频流是主机主导流量, 全接口求和即实时链路速率。
+         QStringLiteral("$s = Get-Counter '\\Network Interface(*)\\Bytes Received/sec','\\Network Interface(*)\\Bytes Sent/sec' -ErrorAction Stop | ForEach-Object { $_.CounterSamples }; "
+                        "$r = [math]::Round(($s | Where-Object { $_.Path -match 'Received' } | Measure-Object CookedValue -Sum).Sum); "
+                        "$t = [math]::Round(($s | Where-Object { $_.Path -match 'Sent' } | Measure-Object CookedValue -Sum).Sum); "
+                        "Write-Output ('R=' + $r); Write-Output ('S=' + $t)")});
 }
 
 void SessionView::attachWindow(qulonglong wid)
@@ -572,9 +673,33 @@ void SessionView::attachWindow(qulonglong wid)
     if (!wid || !::IsWindow(reinterpret_cast<HWND>(wid)))
         return;
 
+    // 同一窗口重复通知(sink 重建/路由抖动)直接忽略, 避免反复销毁重建容器
+    if (wid == m_embeddedHwnd)
+        return;
+
     qInfo().nospace() << "[view] attachWindow wid=" << wid
         << " at " << QDateTime::currentDateTime().toString("HH:mm:ss.zzz")
-        << " session=" << m_sessionId;
+        << " session=" << m_sessionId << " prev=" << m_embeddedHwnd;
+
+    // 已嵌入其它窗口(设备切换/路由异常):先同步销毁旧容器再挂新窗口。
+    // 不能 deleteLater —— 旧容器与新窗口同时存在时, createWindowContainer
+    // 与外部 uxplay 进程对该窗口的操作互相等待, 会卡死 UI 线程。
+    if (m_embeddedHwnd && m_childWindow) {
+        if (auto *g = qobject_cast<QGridLayout *>(this->layout())) {
+            for (int i = g->count() - 1; i >= 0; --i) {
+                QLayoutItem *item = g->itemAt(i);
+                QWidget *w = item ? item->widget() : nullptr;
+                if (w && w != m_infoBadge && w != m_videoArea && w != m_videoLabel) {
+                    g->removeWidget(w);
+                    w->setParent(nullptr);
+                    delete w;
+                    break;
+                }
+            }
+        }
+        m_childWindow = nullptr;
+    }
+    m_embeddedHwnd = wid;
 
     QWindow *native = QWindow::fromWinId(WId(wid));
     if (!native)
@@ -592,7 +717,7 @@ void SessionView::attachWindow(qulonglong wid)
             m_videoArea->deleteLater();
             m_videoArea = nullptr;
         }
-        // Miracast 帧模式:m_videoLabel 是占位 QLabel, swap chain 窗口嵌入后需移除
+        // Miracast 帧模式:m_videoLabel 是占位帧控件, swap chain 窗口嵌入后需移除
         if (m_videoLabel) {
             g->removeWidget(m_videoLabel);
             m_videoLabel->deleteLater();
@@ -602,7 +727,7 @@ void SessionView::attachWindow(qulonglong wid)
         container->show();
     }
     if (m_infoBadge)
-        m_infoBadge->raise();
+        updateInfoBadge();   // 窗口嵌入后:悬浮窗显示并贴紧视图, 且置顶
 
     setStatus(QStringLiteral("已连接"));
     if (!m_thumbTimer.isActive())
@@ -613,13 +738,16 @@ void SessionView::updateInfoBadge()
 {
     if (!m_infoBadge)
         return;
-    if (!isVisible()) {
+    // 无投屏内容(尚未出画)或视图不可见:隐藏悬浮窗;有内容才显示并贴紧视图左上角
+    const bool hasContent = m_childWindow || m_hasFirstFrame;
+    if (!isVisible() || !hasContent) {
         m_infoBadge->hide();
         return;
     }
     // 定位到本视图左上角(全局坐标), 悬浮在视频之上
     m_infoBadge->move(mapToGlobal(QPoint(12, 12)));
     m_infoBadge->show();
+    m_infoBadge->raise();
 }
 
 void SessionView::moveEvent(QMoveEvent *e)

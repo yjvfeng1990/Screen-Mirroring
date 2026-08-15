@@ -149,6 +149,10 @@ MIRROR_API mirror_result_t mirror_start_airplay_gateway(
 /* 停止 AirPlay 网关,销毁所有实例。 */
 MIRROR_API mirror_result_t mirror_stop_airplay_gateway(void);
 
+/* 2 分屏铺满控制文件路径(uxplay 实例轮询该文件, 内容 "1"=铺满 "0"=原比例)。
+ * 由 app 侧在活跃投屏路数 ==2 时写入 "1", 否则写 "0"。返回静态字符串。 */
+MIRROR_API const char *mirror_airplay_fill_file(void);
+
 /*
  * 启动 MS-MICE(Miracast over Infrastructure)接收端。
  * 适合 Windows 发送端(Win+K 无线投屏)通过局域网/有线网络投屏:

@@ -16,6 +16,8 @@
 #include <QDebug>
 #include <QMouseEvent>
 #include <QMetaObject>
+#include <QFile>
+#include <QDir>
 
 DesktopWindow::DesktopWindow(QWidget *parent)
     : QWidget(parent)
@@ -186,9 +188,23 @@ void DesktopWindow::relayout()
         shown.append(view);
     }
 
-    // 单路铺满时:视频填满整窗(居中裁剪, 无黑边);多路网格则等比留边
-    for (SessionView *view : m_views)
-        view->setFillMode(fullBleed && shown.size() == 1 && shown.contains(view));
+    // 仅在 2 分屏时启用铺满:竖屏视频 cover 填满竖格(无黑边);
+    // 单路/3 路及以上全部保持原比例(完整可见)。
+    for (SessionView *view : shown)
+        view->setFillMode(shown.size() == 2);
+
+    // AirPlay(uxplay)侧同步:2 分屏时写 "1"(uxplay 对竖屏视频动态裁切铺满),
+    // 其余写 "0"。只有值变化才写, 避免高频 relayout 反复落盘。
+    static bool lastFill = false;
+    const bool wantFill = (active.size() == 2);
+    if (wantFill != lastFill) {
+        lastFill = wantFill;
+        QFile f(QString::fromUtf8(mirror_airplay_fill_file()));
+        if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            f.write(wantFill ? "1" : "0");
+            f.close();
+        }
+    }
 
     // ---- 快速路径:布局无变化则跳过, 避免切换时重建容器导致闪烁 ----
     if (m_lastShown == shown && m_lastCols == cols && m_lastRows == rows
@@ -322,6 +338,11 @@ void DesktopWindow::startMiracast()
                 this, &DesktopWindow::onViewFullscreen);
         // 首帧前保持隐藏(Miracast 占位会话);收到首帧才在主窗口/列表出现
         connect(view, &SessionView::firstFrameReceived, this, [this]() {
+            relayout();
+            emit sourcesChanged();
+        });
+        // 帧链路断开(设备退出):画面清空回到等待 → 重排/刷新列表
+        connect(view, &SessionView::firstFrameCleared, this, [this]() {
             relayout();
             emit sourcesChanged();
         });
