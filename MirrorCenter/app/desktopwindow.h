@@ -95,6 +95,8 @@ public slots:
     void removeSession(const QString &sessionId);
     /** 控制台选中某来源 → 把它排到主窗口首位 */
     void focusSession(const QString &sessionId);
+    /** 控制面板展开时隐藏右缘触发条(独立顶层窗会浮在面板之上), 收起后恢复 */
+    void setSideTriggerVisible(bool visible);
 
 private:
     void buildUi();
@@ -102,6 +104,8 @@ private:
     void updateEmptyState();
     /** 视图点击全屏/还原 → 切换该会话独占全屏 */
     void onViewFullscreen(const QString &sessionId);
+    /** 右缘触发条重定位(独立顶层窗: 屏幕全局坐标 + 显示控制) */
+    void updateSideTriggerPos();
 
 protected:
     void resizeEvent(QResizeEvent *e) override;
@@ -134,6 +138,7 @@ protected:
     QGridLayout    *m_grid          = nullptr;
     QToolButton    *m_toggleCtrlBtn = nullptr;  // "显示控制台"小按钮
     QWidget        *m_sideTrigger   = nullptr;  // 主窗口右缘内侧触发条(替代原悬浮条)
+    bool            m_sideTriggerEnabled = true; // 控制面板展开时禁用(避免浮在面板上)
     QList<SessionView *> m_views;
     SessionView *m_focusView = nullptr;   // 独占全屏的会话视图(非空时只显示它)
     int  m_layoutMode = 0;   // 0=按会话数自动(1全屏/2左右/3+四宫格), 1/2/3/4/6=手动覆盖

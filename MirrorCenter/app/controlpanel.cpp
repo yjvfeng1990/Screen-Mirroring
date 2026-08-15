@@ -316,12 +316,14 @@ void ControlPanel::expand()
     if (isHidden())
         QWidget::show();
     raise();   // 覆盖在主窗口内容之上
+    emit panelVisibilityChanged(true);
 }
 
 void ControlPanel::collapse()
 {
     m_dockedExpanded = false;
     hide();
+    emit panelVisibilityChanged(false);
 }
 
 void ControlPanel::updateDockGeometry()

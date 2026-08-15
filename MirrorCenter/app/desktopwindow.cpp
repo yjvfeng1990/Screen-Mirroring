@@ -65,12 +65,15 @@ void DesktopWindow::showEvent(QShowEvent *e)
 {
     QWidget::showEvent(e);
     qInfo() << "[win] DesktopWindow showEvent, visible=" << isVisible();
+    updateSideTriggerPos();   // 首次定位并显示右缘触发条(独立顶层窗)
 }
 
 void DesktopWindow::hideEvent(QHideEvent *e)
 {
     QWidget::hideEvent(e);
     qInfo() << "[win] DesktopWindow hideEvent";
+    if (m_sideTrigger)
+        m_sideTrigger->hide();
 }
 
 // HWND 重建诊断: Qt 会在原生窗口需要重建时先销毁再创建, 触发 WinIdChange。
@@ -114,10 +117,11 @@ bool DesktopWindow::event(QEvent *e)
 void DesktopWindow::moveEvent(QMoveEvent *e)
 {
     QWidget::moveEvent(e);
-    // 信息栏是独立顶层窗: 主窗口移动/跨屏时视图相对位置不变(子控件不触发 moveEvent),
-    // 必须在这里联动所有视图的信息栏重定位, 保证信息栏相对主窗口显示。
+    // 信息栏/触发条是独立顶层窗: 主窗口移动/跨屏时视图相对位置不变(子控件不触发
+    // moveEvent), 必须在这里联动所有视图的信息栏重定位, 保证相对主窗口显示。
     for (SessionView *view : m_views)
         view->refreshInfoBadge();
+    updateSideTriggerPos();
 }
 
 void DesktopWindow::closeEvent(QCloseEvent *e)
@@ -217,8 +221,14 @@ void DesktopWindow::buildUi()
     m_toggleCtrlBtn->raise();
 
     // ---- 右缘内侧触发条(替代原独立悬浮触发条窗口) ----
-    // 嵌入主窗口, 随主窗口最小化/关闭一起隐藏, 不再悬浮桌面
+    // 带 parent 的 Qt::Tool 顶层窗(=主窗口的 owned window):
+    //  - z-order 系统保证恒在 owner(主窗口)及其子窗口(嵌入的 AirPlay/Miracast
+    //    D3D11 渲染窗口)之上, 不被盖住
+    //  - 不设 WindowStaysOnTopHint: 随主窗口一起被其它应用窗口覆盖(相对窗口置顶)
+    //  - 跟随主窗口移动/最小化(Windows owned window 行为) + moveEvent 联动双保险
     m_sideTrigger = new QWidget(this);
+    m_sideTrigger->setWindowFlags(Qt::FramelessWindowHint | Qt::Tool);
+    m_sideTrigger->setAttribute(Qt::WA_ShowWithoutActivating);
     m_sideTrigger->setFixedSize(10, 48);
     m_sideTrigger->setStyleSheet(
         "background-color:#20242E; border-top-left-radius:5px;"
@@ -226,8 +236,6 @@ void DesktopWindow::buildUi()
     m_sideTrigger->setCursor(Qt::PointingHandCursor);
     m_sideTrigger->setToolTip(QStringLiteral("展开播放器窗口面板"));
     m_sideTrigger->installEventFilter(this);
-    m_sideTrigger->show();
-    m_sideTrigger->raise();
 }
 
 void DesktopWindow::resizeEvent(QResizeEvent *e)
@@ -238,10 +246,7 @@ void DesktopWindow::resizeEvent(QResizeEvent *e)
         m_toggleCtrlBtn->move(width() - m_toggleCtrlBtn->width() - 16,
                               height() - m_toggleCtrlBtn->height() - 16);
     }
-    if (m_sideTrigger) {
-        m_sideTrigger->move(width() - m_sideTrigger->width() - 4,
-                            (height() - m_sideTrigger->height()) / 2);
-    }
+    updateSideTriggerPos();
 }
 
 void DesktopWindow::setLayoutMode(int mode)
@@ -482,6 +487,11 @@ void DesktopWindow::createMiracastPlaceholders()
             relayout();
             emit sourcesChanged();
         });
+        // AirPlay 窗口嵌入成功 = 出画 → 重排/刷新列表(与首帧等价)
+        connect(view, &SessionView::windowAttached, this, [this]() {
+            relayout();
+            emit sourcesChanged();
+        });
         // 设备名就绪(服务端上报真实名) → 刷新控制面板列表
         connect(view, &SessionView::clientNameChanged, this, [this]() {
             emit sourcesChanged();
@@ -566,6 +576,11 @@ SessionView *DesktopWindow::addSession(const QString &name, mirror_backend_t bac
             this, &DesktopWindow::onViewFullscreen);
     // 首帧前保持隐藏(Miracast 占位会话);收到首帧才在主窗口/列表出现
     connect(view, &SessionView::firstFrameReceived, this, [this]() {
+        relayout();
+        emit sourcesChanged();
+    });
+    // AirPlay 窗口嵌入成功 = 出画 → 重排/刷新列表(与首帧等价)
+    connect(view, &SessionView::windowAttached, this, [this]() {
         relayout();
         emit sourcesChanged();
     });
@@ -800,6 +815,11 @@ void DesktopWindow::onGatewayClientConnected(mirror_session_t *session, const QS
     connect(view, &SessionView::clientNameChanged, this, [this]() {
         emit sourcesChanged();
     });
+    // 嵌入窗口就绪 = 出画 → 重排/刷新列表(网关会话可能在视图创建后才连入)
+    connect(view, &SessionView::windowAttached, this, [this]() {
+        relayout();
+        emit sourcesChanged();
+    });
 
     view->adoptGatewaySession(session, displayName);
     m_views.append(view);
@@ -907,6 +927,30 @@ void DesktopWindow::showToggleCtrlBtn(bool show)
     } else {
         m_toggleCtrlBtn->hide();
     }
+}
+
+void DesktopWindow::updateSideTriggerPos()
+{
+    if (!m_sideTrigger || !m_sideTriggerEnabled)
+        return;
+    // 独立顶层窗: 位置为屏幕全局坐标(右缘内侧 4px, 垂直居中)
+    m_sideTrigger->move(mapToGlobal(QPoint(width() - m_sideTrigger->width() - 4,
+                                           (height() - m_sideTrigger->height()) / 2)));
+    // 注意不能用 isHidden(): 新建窗口未显式 hide() 时 isHidden() 为 false,
+    // 会导致首次永远不 show。用 !isVisible() 判断。
+    if (!m_sideTrigger->isVisible() && isVisible())
+        m_sideTrigger->show();
+}
+
+void DesktopWindow::setSideTriggerVisible(bool visible)
+{
+    m_sideTriggerEnabled = visible;
+    if (!m_sideTrigger)
+        return;
+    if (visible)
+        updateSideTriggerPos();
+    else
+        m_sideTrigger->hide();
 }
 
 bool DesktopWindow::eventFilter(QObject *obj, QEvent *event)

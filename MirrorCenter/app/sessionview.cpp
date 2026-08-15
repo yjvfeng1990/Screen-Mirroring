@@ -994,6 +994,9 @@ void SessionView::attachWindow(qulonglong wid)
         updateInfoBadge();   // 窗口嵌入后:悬浮窗显示并贴紧视图, 且置顶
 
     setStatus(QStringLiteral("已连接"));
+    // 窗口嵌入成功 = AirPlay 出画:通知主窗口重排(否则视图一直隐藏,
+    // 主窗口停留在空状态提示 —— 2026-08-16 实测"AirPlay 有声音但主窗口显示投屏接收中心")。
+    emit windowAttached();
     if (!m_thumbTimer.isActive())
         m_thumbTimer.start();
     // AirPlay 无帧回调:窗口接入后启动内容变化检测(帧率估算)与速率查询。

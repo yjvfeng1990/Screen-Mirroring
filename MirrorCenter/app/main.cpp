@@ -157,12 +157,21 @@ int main(int argc, char *argv[])
                          panel.setPanelVisible(true);
                          desktop.showToggleCtrlBtn(false);
                      });
+    // 面板展开/收起 → 隐藏/恢复右缘触发条(独立顶层窗会浮在面板之上)
+    QObject::connect(&panel, &ControlPanel::panelVisibilityChanged,
+                     [&desktop](bool panelVisible) {
+                         desktop.setSideTriggerVisible(!panelVisible);
+                     });
     // 主窗口关闭 → 联动关闭面板(否则面板残留, app 不退出)
     QObject::connect(&desktop, &DesktopWindow::closeRequested,
                      [&panel]() { panel.close(); });
     // 主窗口最小化/还原 → 联动隐藏/还原面板与触发条
     QObject::connect(&desktop, &DesktopWindow::windowMinimizedChanged,
                      &panel, &ControlPanel::setHostMinimized);
+    QObject::connect(&desktop, &DesktopWindow::windowMinimizedChanged,
+                     [&desktop](bool minimized) {
+                         desktop.setSideTriggerVisible(!minimized);
+                     });
     // 面板"移除投屏设备"按钮 → 断开该设备会话(网关先断连再清理视图)
     QObject::connect(&panel, &ControlPanel::removeRequested,
                      &desktop, &DesktopWindow::removeSession);

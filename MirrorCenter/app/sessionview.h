@@ -111,6 +111,8 @@ signals:
     void thumbnailUpdated();
     /** 收到首帧(自建会话真正出画, 此时才允许主窗口/列表显示) */
     void firstFrameReceived();
+    /** 嵌入窗口就绪(AirPlay 经 WINDOW_HANDLE/on_window 嵌入后触发, 等价于出画) */
+    void windowAttached();
     /** 帧链路断开(设备退出):画面已清空, 回到等待状态(通知主窗口重排/刷新列表) */
     void firstFrameCleared();
     /** 设备真实名称已上报(服务端经帧通道 MCCTRL1 NAME: 送达) */

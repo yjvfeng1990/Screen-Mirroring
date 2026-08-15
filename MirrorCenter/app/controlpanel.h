@@ -91,6 +91,8 @@ private:
 signals:
     /** 用户请求收起控制台 */
     void hideRequested();
+    /** 面板展开/收起状态变化(主窗口据此显示/隐藏右侧触发条) */
+    void panelVisibilityChanged(bool visible);
     /** 用户点击列表项:选中该来源窗口, 由 DesktopWindow 置顶 */
     void sourceSelected(const QString &sessionId);
     /** 用户点击卡片上的"移除"按钮:由 DesktopWindow 断开该设备会话 */
