@@ -42,7 +42,15 @@ Thumbs.db
 
 # 未打通的能力(暂不入库)
 MiracastReceiverSample/
-WinMiracastReceiver/
+
+# Miracast 接收端服务(dotnet): 只入库桌面服务版源码, 忽略构建产物与旧 UWP 版
+WinMiracastReceiver/**/publish*/
+WinMiracastReceiver/**/bin/
+WinMiracastReceiver/**/obj/
+WinMiracastReceiver/MiracastSample/
+WinMiracastReceiver/MiracastSample.sln
+WinMiracastReceiver/chat.md
+WinMiracastReceiver/devcert.*
 
 # 调试辅助脚本
 run_uxplay*.bat

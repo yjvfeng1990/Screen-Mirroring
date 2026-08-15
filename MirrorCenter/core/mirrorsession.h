@@ -66,6 +66,12 @@ public:
     /// Video size (frame mode)
     QSize videoSize() const;
 
+    /// 全屏放大: 向接收服务设置该路目标帧率(0 恢复默认, 1 等低频)
+    void setFrameTargetFps(int fps);
+
+    /// 混合路数分档: 向接收服务设置该路读回最大边(0 不缩放, >0 上限)
+    void setFrameTargetEdge(int edge);
+
     void start();
     void stop();
 

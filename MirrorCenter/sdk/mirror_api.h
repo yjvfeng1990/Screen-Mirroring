@@ -270,6 +270,18 @@ MIRROR_API mirror_result_t mirror_set_callbacks(mirror_session_t *session,
                                                 const mirror_callbacks_t *cbs,
                                                 void *userdata);
 
+/*
+ * 设置目标帧率(Miracast 帧模式): fps>0 强制该路输出帧率, fps=0 恢复默认。
+ * 全屏放大时把其余路降到 1fps(连接保持、开销极低), 焦点路独占 GPU/CPU。
+ */
+MIRROR_API mirror_result_t mirror_set_frame_fps(mirror_session_t *session, int fps);
+
+/*
+ * 设置读回最大边(Miracast 帧模式): edge>=0, 0=不缩放, >0=最大边上限。
+ * 宿主按总活跃路数(含 AirPlay)计算并推送, 覆盖服务端按自身连接数的默认分档。
+ */
+MIRROR_API mirror_result_t mirror_set_frame_edge(mirror_session_t *session, int edge);
+
 /* 获取错误说明(线程本地缓冲,仅供调试)。 */
 MIRROR_API const char *mirror_last_error(void);
 

@@ -69,6 +69,7 @@ public:
     bool isRunning() const { return m_running; }
     mirror_backend_t backend() const { return m_backend; }
     bool isGatewayMode() const { return m_gatewayMode; }
+    mirror_session_t *sdkSession() const { return m_sdkSession; }
 
     /** 网关模式:包装 SDK 已建好的会话句柄(由 on_client_connected 回调提供) */
     void adoptGatewaySession(mirror_session_t *sdkSession, const QString &clientIp);
@@ -124,6 +125,8 @@ private:
     QRect detectSideBars(const QImage &img);
     /** 周期查询 Wifi 网卡性能计数器, 差分显示源网络实时接收/发送速率 */
     void queryNetRate();
+    /** AirPlay 帧率/分辨率估算:窗口内容变化检测 + 客户区尺寸(无帧回调时用) */
+    void estimateAirStats();
     /** 抓取当前画面(平台相关实现) */
     QImage captureThumbnail();
     /** 画面内容指纹比较:有变化返回 true(缩略图去重, 无变化不切图) */
@@ -177,6 +180,13 @@ private:
     quint64 m_netPrevRx = 0;             // 上次采样全接口累计接收字节
     quint64 m_netPrevTx = 0;             // 上次采样全接口累计发送字节
     qint64  m_netPrevMs = 0;             // 上次采样时刻(ms, 0=首采样未就绪)
+    // AirPlay 帧率估算(无帧回调, 用窗口内容变化检测):
+    QTimer m_airStatsTimer;              // 估算节拍(1s)
+    QImage m_airPrevFp;                  // 上次内容指纹(16x9)
+    bool   m_hasAirPrevFp = false;
+    int    m_airChanged = 0;             // 本窗口内检测到内容变化的采样次数
+    int    m_airSamples  = 0;            // 本窗口内采样总数
+    QElapsedTimer m_airWin;              // 1s 滑动窗口计时
     bool m_framePending = false;         // 上一帧是否还没在 UI 线程渲染完(节流用)
     bool m_hasFirstFrame = false;        // 是否已收到首帧(Miracast 占位会话据此隐藏)
     bool m_fillMode = false;             // 铺满整格:等比放大覆盖后居中裁剪(无黑边)

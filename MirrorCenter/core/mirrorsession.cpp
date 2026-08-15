@@ -89,6 +89,18 @@ QSize MirrorSession::videoSize() const
     return m_frameClient ? m_frameClient->videoSize() : QSize();
 }
 
+void MirrorSession::setFrameTargetFps(int fps)
+{
+    if (m_frameClient)
+        m_frameClient->setTargetFps(fps);
+}
+
+void MirrorSession::setFrameTargetEdge(int edge)
+{
+    if (m_frameClient)
+        m_frameClient->setTargetEdge(edge);
+}
+
 void MirrorSession::start()
 {
     if (m_process)

@@ -38,6 +38,8 @@ struct mirror_session {
     bool valid = false;
     QImage frameCache;                 // 最近一帧缓存(data 指针指向它)
     int airplayPortBase = 0;           // AirPlay 实例端口基址(0 = 未分配)
+    int frameFpsOverride = 0;          // 宿主帧率覆盖(全屏放大降帧, 0=默认)
+    int frameEdgeOverride = 0;         // 宿主读回尺寸覆盖(混合路数分档, 0=默认)
 };
 
 // 递归锁:mirror_start_session 等会持锁调用 registerHandle/isHandleValid 等辅助函数,
@@ -1134,6 +1136,34 @@ MIRROR_API mirror_result_t mirror_set_callbacks(mirror_session_t *session,
     else
         session->cbs = mirror_callbacks_t{};
     session->userdata = userdata;
+    return MIRROR_OK;
+}
+
+MIRROR_API mirror_result_t mirror_set_frame_fps(mirror_session_t *session, int fps)
+{
+    if (!session || !isHandleValid(session))
+        return MIRROR_ERR_INVALID_ARG;
+    if (session->core) {
+        session->core->setFrameTargetFps(fps);
+    } else {
+        // MS-MICE 等无子进程后端: 无 FrameClient, 忽略
+        QMutexLocker lock(&g_mutex);
+        session->frameFpsOverride = fps;
+    }
+    return MIRROR_OK;
+}
+
+MIRROR_API mirror_result_t mirror_set_frame_edge(mirror_session_t *session, int edge)
+{
+    if (!session || !isHandleValid(session))
+        return MIRROR_ERR_INVALID_ARG;
+    if (session->core) {
+        session->core->setFrameTargetEdge(edge);
+    } else {
+        // MS-MICE 等无子进程后端: 无 FrameClient, 忽略
+        QMutexLocker lock(&g_mutex);
+        session->frameEdgeOverride = edge;
+    }
     return MIRROR_OK;
 }
 

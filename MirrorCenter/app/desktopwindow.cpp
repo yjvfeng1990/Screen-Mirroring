@@ -26,7 +26,7 @@ DesktopWindow::DesktopWindow(QWidget *parent)
     resize(1280, 800);
     setMinimumSize(800, 500);
     // 黑底:投屏画面的最佳承载背景
-    setStyleSheet("background-color: #05080F;");
+    setStyleSheet("background-color: #000000;");
 
     buildUi();
 
@@ -54,7 +54,7 @@ void DesktopWindow::buildUi()
 
     // ---- 中央画布 ----
     m_canvasInner = new QWidget(this);
-    m_canvasInner->setStyleSheet("background-color: #05080F;");
+    m_canvasInner->setStyleSheet("background-color: #000000;");
     m_canvasLayout = new QVBoxLayout(m_canvasInner);
     m_canvasLayout->setContentsMargins(12, 12, 12, 12);
     m_canvasLayout->setSpacing(0);
@@ -206,6 +206,24 @@ void DesktopWindow::relayout()
         }
     }
 
+    // 混合路数分档(2026-08-15): 分档以宿主总活跃路数(含 AirPlay)为准。
+    // AirPlay 路不走 Miracast 服务, 服务端按自身连接数分档会低估(如
+    // 2 Miracast + 1 AirPlay 仍给 1280); 这里按总路数算好 edge 推给每个
+    // Miracast 会话, 服务端 SETEDGE 覆盖其默认。
+    const int totalN = active.size();
+    const int edge = totalN >= 10 ? 480
+                   : totalN >= 5  ? 640
+                   : totalN >= 3  ? 960
+                   : totalN >= 2  ? 1280
+                   : 0;
+    for (SessionView *view : m_views) {
+        if (view->backend() != MIRROR_BACKEND_MIRACAST)
+            continue;
+        mirror_session_t *s = view->sdkSession();
+        if (s)
+            mirror_set_frame_edge(s, edge);
+    }
+
     // ---- 快速路径:布局无变化则跳过, 避免切换时重建容器导致闪烁 ----
     if (m_lastShown == shown && m_lastCols == cols && m_lastRows == rows
         && m_lastFullBleed == fullBleed && m_lastEmpty == active.isEmpty()) {
@@ -269,7 +287,7 @@ void DesktopWindow::onViewFullscreen(const QString &sessionId)
         return;
 
     if (m_focusView == target) {
-        // 还原:恢复自动布局
+        // 还原:恢复自动布局 + 所有路恢复默认帧率
         m_focusView = nullptr;
         if (target)
             target->setFullscreenActive(false);
@@ -277,6 +295,18 @@ void DesktopWindow::onViewFullscreen(const QString &sessionId)
         m_focusView = target;
         target->setFullscreenActive(true);
     }
+
+    // 全屏放大场景(2026-08-15):焦点路独占 GPU/CPU 帧率回满,
+    // 其余被遮住的路降到 1fps(连接保持, 开销可忽略), 还原后全部恢复。
+    // 帧率经 SDK → FrameClient → TCP "SETFPS n" 通知接收服务。
+    for (SessionView *v : m_views) {
+        mirror_session_t *s = v->sdkSession();
+        if (!s)
+            continue;
+        const bool isFocus = (m_focusView == v);
+        mirror_set_frame_fps(s, isFocus ? 0 : 1);
+    }
+
     relayout();
 }
 

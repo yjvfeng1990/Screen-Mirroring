@@ -111,7 +111,7 @@ void GLFrameSurface::paintGL()
                    ? QOpenGLContext::currentContext()->functions() : nullptr;
     if (!gl)
         return;
-    gl->glClearColor(18.0f / 255.0f, 20.0f / 255.0f, 26.0f / 255.0f, 1.0f);
+    gl->glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     gl->glClear(GL_COLOR_BUFFER_BIT);
     if (!m_tex || m_dst.isEmpty() || !m_prog || !m_prog->isLinked())
         return;
@@ -180,6 +180,11 @@ SessionView::SessionView(const QString &deviceName, mirror_backend_t backend,
     // 得到源网络实际接收/发送速率(Mbps)
     m_netTimer.setInterval(2500);
     connect(&m_netTimer, &QTimer::timeout, this, [this]() { queryNetRate(); });
+
+    // AirPlay 帧率估算(无帧回调):周期抓窗口内容指纹, 变化率 → 动态/静止。
+    // 500ms 采样足够判断活动状态, 且避免高频 PrintWindow 抓取增加 CPU 开销。
+    m_airStatsTimer.setInterval(500);
+    connect(&m_airStatsTimer, &QTimer::timeout, this, [this]() { estimateAirStats(); });
 
     // Miracast 仍走"自建会话"流程;AirPlay 由网关回调 adoptGatewaySession 包装。
     // deferStart=true 时(多路 Miracast 组)由 DesktopWindow 调用 adoptManualSession 接管。
@@ -383,6 +388,9 @@ void SessionView::stop()
 {
     m_thumbTimer.stop();
     m_netTimer.stop();
+    m_airStatsTimer.stop();
+    m_airChanged = 0; m_airSamples = 0;
+    m_hasAirPrevFp = false;
     m_lastThumb = QPixmap();
     m_thumbFp = QImage();
     m_hasThumbFp = false;
@@ -403,6 +411,10 @@ void SessionView::detach()
     // 移除嵌入的视频窗口容器(视图随后由 DesktopWindow 删除)
     m_thumbTimer.stop();
     m_netTimer.stop();
+    m_airStatsTimer.stop();
+    m_airChanged = 0;
+    m_airSamples = 0;
+    m_hasAirPrevFp = false;
     m_lastThumb = QPixmap();
     m_thumbFp = QImage();
     m_hasThumbFp = false;
@@ -456,6 +468,12 @@ void SessionView::onStateCallback(mirror_session_t *session, mirror_state_t stat
                 self->m_videoLabel->clearFrame();
             self->m_hasFirstFrame = false;
             self->m_lastThumb = QPixmap();
+            // AirPlay 断开:停止内容变化检测与速率查询, 避免空抓取空耗
+            self->m_airStatsTimer.stop();
+            self->m_airChanged = 0;
+            self->m_airSamples = 0;
+            self->m_hasAirPrevFp = false;
+            self->m_netTimer.stop();
             emit self->firstFrameCleared();
             self->updateInfoBadge();   // 无内容了:悬浮窗随之隐藏
         } else if (state == MIRROR_STATE_CLOSED) {
@@ -697,15 +715,19 @@ void SessionView::renderFrame()
     QRectF src(barRect), dst;
     if (fill) {
         // 高度优先铺满:高度 100%(上下不裁), 宽度超出才裁左右, 不足居中留边
-        const double s = target.height() / src.height();
+        // 2026-08-15:裁切仅左右各留 10px 黑边, 上下贴满格子边缘。
+        const double inset = 10.0;
+        const double availW = target.width() - inset * 2;
+        const double availH = target.height();
+        const double s = availH / src.height();
         const double fitW = src.width() * s;
-        if (fitW >= target.width()) {
-            dst = QRectF(0, 0, target.width(), target.height());
-            const double needW = src.width() * target.width() / fitW;
+        if (fitW >= availW) {
+            dst = QRectF(inset, 0, availW, availH);
+            const double needW = src.width() * availW / fitW;
             const double dx = (src.width() - needW) / 2.0;
             src = QRectF(src.left() + dx, src.top(), needW, src.height());
         } else {
-            dst = QRectF((target.width() - fitW) / 2.0, 0, fitW, target.height());
+            dst = QRectF(inset + (availW - fitW) / 2.0, 0, fitW, availH);
         }
     } else {
         // 等比留边:完整可见, 居中
@@ -799,6 +821,78 @@ void SessionView::queryNetRate()
                              .arg(txMbps, 0, 'f', 1));
 }
 
+void SessionView::estimateAirStats()
+{
+    // AirPlay 无帧回调(Miracast 有 on_frame → renderFrame):
+    // 分辨率从嵌入的 d3d11videosink 窗口客户区尺寸取, 帧率用内容变化估算。
+    if (!m_childWindow || !m_infoBadge)
+        return;
+
+    // 1) 分辨率:窗口客户区尺寸即视频尺寸(嵌入的 uxplay 渲染窗口)
+    const WId wid = m_childWindow->winId();
+    HWND hwnd = reinterpret_cast<HWND>(wid);
+    RECT rc{};
+    if (hwnd && ::IsWindow(hwnd) && ::GetClientRect(hwnd, &rc) == TRUE
+        && rc.right > 0 && rc.bottom > 0) {
+        const int w = rc.right - rc.left;
+        const int h = rc.bottom - rc.top;
+        if (w != m_lastW || h != m_lastH) {
+            m_lastW = w;
+            m_lastH = h;
+            if (m_resLabel)
+                m_resLabel->setText(QStringLiteral("%1×%2").arg(w).arg(h));
+        }
+    }
+
+    // 2) 帧率估算:周期抓窗口内容指纹(16x9), 变化采样占比 → 估算活动帧率。
+    //    采样频率(250ms)低于真实帧率时只能区分"动态/静止", 无法精确计数,
+    //    因此显示区间而非精确值。
+    const QImage img = captureThumbnail();
+    if (img.isNull())
+        return;
+    const QImage fp = img.scaled(16, 9, Qt::IgnoreAspectRatio, Qt::FastTransformation);
+    if (!m_hasAirPrevFp) {
+        m_airPrevFp = fp;
+        m_hasAirPrevFp = true;
+        return;   // 首采样仅建立基准
+    }
+    bool changed = false;
+    if (fp != m_airPrevFp) {   // QImage operator== 逐像素比较(144 像素)
+        int diff = 0;
+        const int total = fp.width() * fp.height();
+        for (int y = 0; y < fp.height(); ++y) {
+            for (int x = 0; x < fp.width(); ++x) {
+                const QRgb a = fp.pixel(x, y);
+                const QRgb b = m_airPrevFp.pixel(x, y);
+                if (qAbs(qRed(a) - qRed(b)) + qAbs(qGreen(a) - qGreen(b))
+                    + qAbs(qBlue(a) - qBlue(b)) > 24)
+                    ++diff;
+            }
+        }
+        changed = (double(diff) / total) > 0.01;
+    }
+    m_airPrevFp = fp;
+    if (changed)
+        ++m_airChanged;
+    ++m_airSamples;
+
+    // 1s 滑动窗口结算:变化采样占比 → 动态/静止(区间)
+    if (m_airWin.elapsed() >= 1000) {
+        const double pct = m_airSamples ? double(m_airChanged) / m_airSamples : 0.0;
+        if (m_fpsLabel) {
+            if (pct >= 0.5)
+                m_fpsLabel->setText(QStringLiteral("动态"));
+            else if (pct > 0.0)
+                m_fpsLabel->setText(QStringLiteral("缓慢"));
+            else
+                m_fpsLabel->setText(QStringLiteral("静止"));
+        }
+        m_airChanged = 0;
+        m_airSamples = 0;
+        m_airWin.restart();
+    }
+}
+
 void SessionView::attachWindow(qulonglong wid)
 {
     // 设备断开后 GStreamer/d3d11 会销毁渲染窗口, 重连/新设备可能拿到已失效句柄。
@@ -865,6 +959,13 @@ void SessionView::attachWindow(qulonglong wid)
     setStatus(QStringLiteral("已连接"));
     if (!m_thumbTimer.isActive())
         m_thumbTimer.start();
+    // AirPlay 无帧回调:窗口接入后启动内容变化检测(帧率估算)与速率查询。
+    // 仅 AirPlay 走此路径(Miracast 由 renderFrame 的帧回调更新统计)。
+    if (m_backend == MIRROR_BACKEND_AIRPLAY) {
+        m_airWin.start();
+        m_airStatsTimer.start();
+        m_netTimer.start();
+    }
 }
 
 void SessionView::updateInfoBadge()
