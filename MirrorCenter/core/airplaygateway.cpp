@@ -47,12 +47,20 @@ QString AirPlayGateway::findLocalIpv4() const
     QString fallback;
 
     auto isWifi = [](const QNetworkInterface &i) {
+        // 同时匹配接口友好名(WLAN/Wi-Fi)与适配器描述(humanReadableName,
+        // Windows 上是品牌名, 如 "Intel(R) Wi-Fi 6E AX210 160MHz")。
+        // 只按 name() 关键词匹配会在换网卡/驱动后失效(接口名不含关键词时
+        // isWifi 落空退 fallback, 多网卡机器上可能选错网卡 → iPhone 收不到广播)。
         const QString n = i.name();
+        const QString hn = i.humanReadableName();
         return n.contains(QStringLiteral("WLAN"), Qt::CaseInsensitive)
             || n.contains(QStringLiteral("Wi-Fi"), Qt::CaseInsensitive)
             || n.contains(QStringLiteral("Wireless"), Qt::CaseInsensitive)
             || n.contains(QStringLiteral("Wireless LAN"), Qt::CaseInsensitive)
-            || n.contains(QStringLiteral("无线"), Qt::CaseInsensitive);
+            || n.contains(QStringLiteral("无线"), Qt::CaseInsensitive)
+            || hn.contains(QStringLiteral("Wi-Fi"), Qt::CaseInsensitive)
+            || hn.contains(QStringLiteral("Wireless"), Qt::CaseInsensitive)
+            || hn.contains(QStringLiteral("802.11"), Qt::CaseInsensitive);
     };
     auto isDirectGo = [](const QNetworkInterface &i) {
         if (i.name().contains(QStringLiteral("Direct"), Qt::CaseInsensitive))

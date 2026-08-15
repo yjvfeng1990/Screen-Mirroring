@@ -242,6 +242,20 @@ QString MiceBackend::findLocalIpv4() const
             continue;
         if (iface.name().contains(QStringLiteral("vEthernet"), Qt::CaseInsensitive))
             continue;
+        // 排除 Wi-Fi Direct GO 虚拟接口(与 AirPlay 网关同款判断):
+        // Miracast 接收时系统创建 GO 接口(名字含 "Direct" 或 192.168.137.1),
+        // 它只是 P2P 投屏网段, 选它的 IP 做 mDNS 广播地址不可达。
+        if (iface.name().contains(QStringLiteral("Direct"), Qt::CaseInsensitive))
+            continue;
+        bool isGo = false;
+        const auto entries0 = iface.addressEntries();
+        for (const QNetworkAddressEntry &e0 : entries0) {
+            const quint32 ip0 = e0.ip().toIPv4Address();
+            if ((ip0 & 0xffffff00u) == 0xc0a88900u)   // 192.168.137.x
+                { isGo = true; break; }
+        }
+        if (isGo)
+            continue;
         const auto entries = iface.addressEntries();
         for (const QNetworkAddressEntry &e : entries) {
             if (e.ip().protocol() != QAbstractSocket::IPv4Protocol ||
