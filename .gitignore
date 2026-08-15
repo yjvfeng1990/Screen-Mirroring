@@ -1,6 +1,7 @@
 # 构建产物
 build/
 build2/
+build-release/
 build-msys/
 cmake-build-*/
 CMakeCache.txt

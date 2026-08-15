@@ -116,6 +116,13 @@ void MirrorSession::start()
 
     m_process = new QProcess(this);
     m_process->setProcessChannelMode(QProcess::SeparateChannels);
+#ifdef _WIN32
+    // 隐藏子进程控制台窗口(uxplay / miracast-service 是控制台程序, 默认会弹 conhost 窗口)
+    m_process->setCreateProcessArgumentsModifier(
+        [](QProcess::CreateProcessArguments *args) {
+            args->flags |= CREATE_NO_WINDOW;
+        });
+#endif
 
     // AirPlay(UxPlay)依赖 GStreamer,Windows 下插件随 exe 部署在 gstreamer-1.0/ 目录,
     // 必须显式指定 GST_PLUGIN_PATH,否则 uxplay 报 "Required gstreamer plugin not found"

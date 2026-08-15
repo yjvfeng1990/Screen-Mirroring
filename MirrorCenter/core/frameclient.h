@@ -55,6 +55,7 @@ private:
     QPointer<QTcpServer> m_server;
     QPointer<QTcpSocket> m_socket;
     QByteArray m_buffer;
+    int m_bufferOffset = 0;   // 已消费前缀偏移(避免每帧 remove 触发 8MB memmove)
     bool m_headerParsed = false;
     int m_width = 0;
     int m_height = 0;

@@ -2,74 +2,46 @@
 
 #include <QWidget>
 #include <QPointer>
-#include <QProcess>
 #include <QImage>
 #include <QTimer>
 #include <QPixmap>
 #include <QPainter>
 #include <QElapsedTimer>
+#include <QOpenGLWidget>
 
 class QLabel;
 class QWindow;
+class QOpenGLTexture;
+class QOpenGLShaderProgram;
 
 /**
- * 帧显示控件:自绘 QWidget, 替代 QLabel 用于 Miracast 帧显示。
- * QLabel::setPixmap 会触发样式表解析 + 布局 + 全量重绘, Debug 软件渲染下 1280x800
- * 每帧耗时 50-100ms, 直接拖垮显示帧率(实测仅 6-13fps)。
- * 这里只做"存图 + 居中绘制", 配合 WA_OpaquePaintEvent 跳过背景擦除, 重绘开销极小。
+ * 帧显示控件:QOpenGLWidget + GPU 纹理缩放。
+ * 替代自绘 QWidget 的软件路径 —— 软缩放(CPU) + QPixmap::fromImage(CPU 拷贝)
+ * + 软件合成(CPU) 全部改由 GPU 完成:帧零拷贝包装后 setFrame 上传为纹理,
+ * paintGL 中 QPainter::drawTexture 用 GPU 完成缩放/裁切/留边, CPU 仅算矩形。
+ * 每会话独立 GL 控件/纹理(多路分屏互不影响)。
  */
-class FrameSurface : public QWidget
+class GLFrameSurface : public QOpenGLWidget
 {
     Q_OBJECT
 public:
-    explicit FrameSurface(QWidget *parent = nullptr)
-        : QWidget(parent)
-    {
-        setAttribute(Qt::WA_OpaquePaintEvent);
-    }
+    explicit GLFrameSurface(QWidget *parent = nullptr);
+    ~GLFrameSurface() override;
 
-    void setFrame(const QPixmap &pm)
-    {
-        m_frame = pm;
-        update();
-    }
-    QPixmap frame() const { return m_frame; }
-    void clearFrame()
-    {
-        m_frame = QPixmap();
-        update();
-    }
+    /** 上传帧并标记重绘:src 为源图像像素区域(黑边裁切), dst 为目标区域(高度优先/等比留边)。
+     *  上传同步完成, 调用后 img 可安全释放(SDK 帧 buffer 无需持有)。 */
+    void setFrame(const QImage &img, const QRectF &src, const QRectF &dst);
+    void clearFrame();
 
 protected:
-    void paintEvent(QPaintEvent *) override
-    {
-        QElapsedTimer dbg; dbg.start();
-        QPainter pa(this);
-        if (m_frame.isNull()) {
-            // 无帧:擦为深色背景(WA_OpaquePaintEvent 下必须显式填充, 否则残留上一帧像素)
-            pa.fillRect(rect(), QColor(18, 20, 26));
-            if (m_dbg++ % 30 == 0)
-                qInfo() << "[paint] empty";
-            return;
-        }
-        if (m_frame.size() == size()) {
-            // 铺满模式:图已按控件尺寸裁剪, 全幅绘制
-            pa.drawPixmap(0, 0, m_frame);
-        } else {
-            // 等比留边模式:先擦背景再居中绘制
-            pa.fillRect(rect(), QColor(18, 20, 26));
-            const QPoint pos((width() - m_frame.width()) / 2,
-                             (height() - m_frame.height()) / 2);
-            pa.drawPixmap(pos, m_frame);
-        }
-        if (m_dbg++ % 30 == 0)
-            qInfo() << "[paint]" << width() << "x" << height()
-                    << "=" << dbg.nsecsElapsed() / 1000 << "us";
-    }
+    void initializeGL() override;
+    void paintGL() override;
 
 private:
-    QPixmap m_frame;
-    int m_dbg = 0;
+    QRectF m_src;                 // 源图像采样区域(像素)
+    QRectF m_dst;                 // 目标绘制区域(控件坐标)
+    QOpenGLTexture *m_tex = nullptr;
+    QOpenGLShaderProgram *m_prog = nullptr;
 };
 
 // 引入 SDK C 接口
@@ -186,7 +158,7 @@ private:
     QLabel  *m_fpsLabel       = nullptr;   // 帧率
     QLabel  *m_rateLabel      = nullptr;   // 上下行数据传输率
     QLabel  *m_devLabel       = nullptr;   // 来源手机名称(初始为 IP)
-    FrameSurface *m_videoLabel  = nullptr;  // Miracast 帧显示(自绘, 无 QLabel 重绘开销)
+    GLFrameSurface *m_videoLabel = nullptr;  // Miracast 帧显示(GPU 纹理缩放, 无软件缩放 CPU 开销)
     class QToolButton *m_muteBtn = nullptr; // 静音切换
     class QToolButton *m_fullBtn = nullptr; // 全屏切换
     bool m_muted            = false;
@@ -200,9 +172,11 @@ private:
     QElapsedTimer m_rateTimer;           // 窗口计时器
     int m_lastFps = 0;                   // 最近 1s 统计的帧率
     int m_lastW = 0, m_lastH = 0;        // 最近帧分辨率
-    // 无线链路速率(Get-Counter 实时性能计数器, 源网络实际接收/发送速率)
+    // 无线链路速率(GetIfTable2 全接口字节增量差分, 无外部进程开销)
     QTimer m_netTimer;                   // 周期查询定时器
-    QProcess *m_netProc = nullptr;       // 正在执行的查询进程
+    quint64 m_netPrevRx = 0;             // 上次采样全接口累计接收字节
+    quint64 m_netPrevTx = 0;             // 上次采样全接口累计发送字节
+    qint64  m_netPrevMs = 0;             // 上次采样时刻(ms, 0=首采样未就绪)
     bool m_framePending = false;         // 上一帧是否还没在 UI 线程渲染完(节流用)
     bool m_hasFirstFrame = false;        // 是否已收到首帧(Miracast 占位会话据此隐藏)
     bool m_fillMode = false;             // 铺满整格:等比放大覆盖后居中裁剪(无黑边)

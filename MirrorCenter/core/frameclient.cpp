@@ -110,27 +110,38 @@ void FrameClient::onReadyRead()
     m_buffer.append(m_socket->readAll());
     while (tryParseFrame())
         ;
+    // 压缩消费掉的前缀:仅在偏移过半时做一次 memmove, 避免每帧 8MB 移动
+    if (m_bufferOffset > 0 && m_bufferOffset >= m_buffer.size() / 2) {
+        m_buffer.remove(0, m_bufferOffset);
+        m_bufferOffset = 0;
+    }
 }
 
 bool FrameClient::tryParseFrame()
 {
+    const int avail = m_buffer.size() - m_bufferOffset;
     // 解析头部
     if (!m_headerParsed) {
-        if (m_buffer.size() < kHeaderSize)
+        if (avail < kHeaderSize)
             return false;
-        if (memcmp(m_buffer.constData(), kMagic, 8) != 0) {
+        if (memcmp(m_buffer.constData() + m_bufferOffset, kMagic, 8) != 0) {
             // 数据不同步,丢弃一个字节重试
-            m_buffer.remove(0, 1);
+            ++m_bufferOffset;
+            if (m_bufferOffset > 4096) {
+                m_buffer.remove(0, m_bufferOffset);
+                m_bufferOffset = 0;
+            }
             return true;
         }
-        QDataStream ds(m_buffer.mid(8, 16));
+        QDataStream ds(QByteArray::fromRawData(
+            m_buffer.constData() + m_bufferOffset + 8, 16));
         ds.setByteOrder(QDataStream::LittleEndian);
         ds >> m_width >> m_height >> m_stride >> m_payloadSize;
         m_headerParsed = true;
     }
 
     // 等待完整负载
-    if (m_buffer.size() < kHeaderSize + m_payloadSize)
+    if (avail < kHeaderSize + m_payloadSize)
         return false;
 
     // 拷贝帧数据。协议:stride==0 → JPEG(服务端压缩传输,节省 P2P 无线带宽);
@@ -139,7 +150,7 @@ bool FrameClient::tryParseFrame()
     // 与 BGRA 匹配;且不预乘 alpha(避免 D3D surface alpha=0 时按
     // ARGB32_Premultiplied 解释导致整体花屏/透明)。
     const uchar *payload = reinterpret_cast<const uchar *>(
-        m_buffer.constData() + kHeaderSize);
+        m_buffer.constData() + m_bufferOffset + kHeaderSize);
     // 双缓冲:挑一块"当前未显示"的 QImage 复用(尺寸不变时零分配)。
     // m_latestFrame 可能正被 UI 线程引用(隐式共享), 不能原地写它。
     QImage *back = (m_ping.constBits() == m_latestFrame.constBits()) ? &m_pong : &m_ping;
@@ -153,30 +164,35 @@ bool FrameClient::tryParseFrame()
         if (dec.loadFromData(payload, m_payloadSize)) {
             *back = dec;
         } else {
-            m_buffer.remove(0, kHeaderSize + m_payloadSize);
+            m_bufferOffset += kHeaderSize + m_payloadSize;
             m_headerParsed = false;
             return true;
         }
     } else {
         const int dstStride = back->bytesPerLine();
-        const uchar *src = payload;
-        uchar *dst = back->bits();
-        const int copyBytes = qMin(m_stride, dstStride);
-        for (int y = 0; y < m_height; ++y) {
-            memcpy(dst + y * dstStride, src + y * m_stride, copyBytes);
+        if (m_stride == dstStride) {
+            // stride 一致:整块一次 memcpy(1080p 8MB, 避免逐行 1080 次调用)
+            memcpy(back->bits(), payload, static_cast<size_t>(m_height) * m_stride);
+        } else {
+            const uchar *src = payload;
+            uchar *dst = back->bits();
+            const int copyBytes = qMin(m_stride, dstStride);
+            for (int y = 0; y < m_height; ++y) {
+                memcpy(dst + y * dstStride, src + y * m_stride, copyBytes);
+            }
         }
     }
     if (back->isNull()) {
         // 解码失败:丢弃这一帧,继续等下一帧(避免坏帧卡住链路)
-        m_buffer.remove(0, kHeaderSize + m_payloadSize);
+        m_bufferOffset += kHeaderSize + m_payloadSize;
         m_headerParsed = false;
         return true;
     }
     m_latestFrame = *back;   // 隐式共享换手,零拷贝
     m_videoSize = QSize(m_width, m_height);
 
-    // 移除已消费数据
-    m_buffer.remove(0, kHeaderSize + m_payloadSize);
+    // 移除已消费数据(仅移动偏移, 实际内存由 onReadyRead 统一压缩)
+    m_bufferOffset += kHeaderSize + m_payloadSize;
     m_headerParsed = false;
 
     // 日志节流:每 150 帧输出一次帧率,便于确认链路通且不掉帧

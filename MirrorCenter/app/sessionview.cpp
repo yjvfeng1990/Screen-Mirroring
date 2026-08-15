@@ -1,9 +1,17 @@
+#ifdef _WIN32
+// winsock2.h 必须先于一切(windows.h 默认引入 winsock.h, 后含 winsock2.h 会冲突);
+// ws2ipdef.h 定义 _WS2IPDEF_, 否则 SDK 26100 的 netioapi.h 会跳过
+// MIB_IF_ROW2/GetIfTable2/FreeMibTable 整段声明
+#include <winsock2.h>
+#include <ws2ipdef.h>
+#include <windows.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
+#pragma comment(lib, "iphlpapi.lib")
+#endif
+
 #include "sessionview.h"
 #include "audiocontrol.h"
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 #include <QLabel>
 #include <QToolButton>
@@ -15,6 +23,132 @@
 #include <QDateTime>
 #include <QMetaObject>
 #include <QPixmap>
+#include <QOpenGLContext>
+#include <QOpenGLFunctions>
+#include <QOpenGLTexture>
+#include <QOpenGLPixelTransferOptions>
+#include <QOpenGLShaderProgram>
+
+// ---- GLFrameSurface:GPU 纹理上传 + GPU 着色器缩放/裁切绘制 ----
+GLFrameSurface::GLFrameSurface(QWidget *parent)
+    : QOpenGLWidget(parent)
+{
+    setAutoFillBackground(false);
+}
+
+GLFrameSurface::~GLFrameSurface()
+{
+    makeCurrent();
+    delete m_tex;
+    m_tex = nullptr;
+    doneCurrent();
+}
+
+void GLFrameSurface::initializeGL()
+{
+    m_prog = new QOpenGLShaderProgram(this);
+    // 顶点:纹理坐标 y 与图像一致(图像顶部 v0), 绘制时目标矩形顶部在 GL 上方
+    const char *vsrc =
+        "attribute vec2 aPos;"
+        "attribute vec2 aUV;"
+        "varying vec2 vUV;"
+        "void main(){ vUV = aUV; gl_Position = vec4(aPos, 0.0, 1.0); }";
+    const char *fsrc =
+        "uniform sampler2D uTex;"
+        "varying vec2 vUV;"
+        "void main(){ gl_FragColor = texture2D(uTex, vUV); }";
+    if (!m_prog->addShaderFromSourceCode(QOpenGLShader::Vertex, vsrc)
+        || !m_prog->addShaderFromSourceCode(QOpenGLShader::Fragment, fsrc)
+        || !m_prog->link())
+        qWarning() << "[GL] shader link failed:" << m_prog->log();
+}
+
+void GLFrameSurface::setFrame(const QImage &img, const QRectF &src, const QRectF &dst)
+{
+    m_src = src;
+    m_dst = dst;
+    if (img.isNull()) {
+        update();
+        return;
+    }
+    makeCurrent();
+    if (!m_tex) {
+        m_tex = new QOpenGLTexture(QOpenGLTexture::Target2D);
+        m_tex->setMinificationFilter(QOpenGLTexture::Linear);
+        m_tex->setMagnificationFilter(QOpenGLTexture::Linear);
+        m_tex->setWrapMode(QOpenGLTexture::ClampToEdge);
+    }
+    if (m_tex->width() != img.width() || m_tex->height() != img.height()) {
+        // 尺寸变化:全量分配+上传
+        m_tex->destroy();
+        m_tex->setData(img);
+    } else {
+        // 同尺寸走区域上传(GPU 同步, 无 CPU 像素拷贝):
+        // RGB32 内存布局 = BGRA 小端, 直接零拷贝上传
+        QOpenGLPixelTransferOptions opt;
+        opt.setRowLength(img.bytesPerLine() / 4);   // 处理 stride 可能大于 w*4
+        m_tex->setData(0, 0, 0, QOpenGLTexture::CubeMapPositiveX,
+                       QOpenGLTexture::BGRA, QOpenGLTexture::UInt8,
+                       img.constBits(), &opt);
+    }
+    doneCurrent();
+    update();
+}
+
+void GLFrameSurface::clearFrame()
+{
+    makeCurrent();
+    if (m_tex)
+        m_tex->destroy();
+    doneCurrent();
+    m_src = m_dst = QRectF();
+    update();
+}
+
+void GLFrameSurface::paintGL()
+{
+    auto *gl = QOpenGLContext::currentContext()
+                   ? QOpenGLContext::currentContext()->functions() : nullptr;
+    if (!gl)
+        return;
+    gl->glClearColor(18.0f / 255.0f, 20.0f / 255.0f, 26.0f / 255.0f, 1.0f);
+    gl->glClear(GL_COLOR_BUFFER_BIT);
+    if (!m_tex || m_dst.isEmpty() || !m_prog || !m_prog->isLinked())
+        return;
+    // GPU 缩放/裁切:纹理坐标取源区域, 顶点(NCD)取目标区域
+    // 注意:QImage 上传后图像顶部对应纹理坐标 v=1(OpenGL 原点在左下), 需翻转 v
+    const int tw = m_tex->width(), th = m_tex->height();
+    const float u0 = float(m_src.left()) / tw;
+    const float u1 = float(m_src.right() + 1.0) / tw;
+    const float vTop = 1.0f - float(m_src.top()) / th;          // 图像顶部 → v 大
+    const float vBot = 1.0f - float(m_src.bottom() + 1.0) / th; // 图像底部 → v 小
+    const float w = float(width()), h = float(height());
+    const float x0 = float(m_dst.left()) / w * 2.0f - 1.0f;
+    const float x1 = float(m_dst.right() + 1.0) / w * 2.0f - 1.0f;
+    const float y0 = float(m_dst.bottom()) / h * 2.0f - 1.0f;   // 控件底部 → GL 下方
+    const float y1 = float(m_dst.top()) / h * 2.0f - 1.0f;      // 控件顶部 → GL 上方
+    // 三角形带:左下 → 右下 → 左上 → 右上; 顶点布局 [x, y, u, v]
+    const float verts[4][4] = {
+        { x0, y0, u0, vBot },
+        { x1, y0, u1, vBot },
+        { x0, y1, u0, vTop },
+        { x1, y1, u1, vTop },
+    };
+    const float *vertsf = &verts[0][0];
+    m_prog->bind();
+    m_tex->bind(0);
+    m_prog->setUniformValue("uTex", 0);
+    const int posLoc = m_prog->attributeLocation("aPos");
+    const int uvLoc  = m_prog->attributeLocation("aUV");
+    m_prog->enableAttributeArray(posLoc);
+    m_prog->setAttributeArray(posLoc, GL_FLOAT, vertsf, 2, int(sizeof(float) * 4));
+    m_prog->enableAttributeArray(uvLoc);
+    m_prog->setAttributeArray(uvLoc, GL_FLOAT, vertsf + 2, 2, int(sizeof(float) * 4));
+    gl->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    m_prog->disableAttributeArray(posLoc);
+    m_prog->disableAttributeArray(uvLoc);
+    m_prog->release();
+}
 
 SessionView::SessionView(const QString &deviceName, mirror_backend_t backend,
                          QWidget *parent, bool deferStart)
@@ -90,8 +224,8 @@ void SessionView::buildUi()
     layout->addWidget(m_videoArea, 0, 0);
 
     if (m_backend == MIRROR_BACKEND_MIRACAST) {
-        // Miracast 帧模式:用自绘控件显示最新帧(铺满整格)
-        m_videoLabel = new FrameSurface(this);
+        // Miracast 帧模式:GPU 纹理控件显示最新帧(铺满整格)
+        m_videoLabel = new GLFrameSurface(this);
         layout->removeWidget(m_videoArea);
         m_videoArea->deleteLater();
         m_videoArea = nullptr;
@@ -429,9 +563,9 @@ QImage SessionView::captureThumbnail()
         return img;
     }
 #endif
-    // Miracast:帧模式,直接取最近显示的画面
+    // Miracast:帧模式,直接从 GPU 控件读回当前渲染画面
     if (m_videoLabel) {
-        QPixmap p = m_videoLabel->frame();
+        QPixmap p = m_videoLabel->grab();
         if (!p.isNull())
             return p.toImage();
     }
@@ -518,7 +652,7 @@ void SessionView::renderFrame()
     }
 
     // stride 与宽度对齐(RGB32 每行 4 字节)时零拷贝包装, 避免 8MB 逐行 memcpy;
-    // frame.data 在本次调用期间有效, scaled 同步完成, 输出为独立 buffer, 安全。
+    // frame.data 在本次调用期间有效, setFrame 内同步上传为纹理, 输出安全。
     QImage img;
     if (frame.stride == frame.width * 4) {
         img = QImage(frame.data, frame.width, frame.height, frame.stride,
@@ -532,29 +666,13 @@ void SessionView::renderFrame()
                    copyBytes);
         }
     }
+    // ---- 布局计算:缩放/裁切/留边全部由 GPU 完成, CPU 仅算矩形 ----
     // 铺满仅用于 2 分屏:竖屏视频铺满格子, 横屏视频保持原比例(完整可见);
     // 其它分屏(1 屏/3 屏以上)一律保持原比例。只看视频方向, 与格子方向无关。
     // 安卓 Miracast 流恒横屏(如 1920x1080), 竖屏内容在帧内居中带左右黑边,
     // 通过 detectSideBars 裁出竖屏内容区后同样铺满; 真横屏内容不变。
     // 铺满采用"高度优先":高度 100% 显示(内容不裁切), 宽度超出才裁左右,
     // 不足则居中留深色边 —— 避免竖屏视频上下被裁掉一截。
-    static auto scaledToFillHeight = [](const QImage &src, const QSize &target) {
-        if (target.isEmpty())
-            return src;
-        const double s = double(target.height()) / src.height();
-        const QSize sz(qMax(1, qRound(src.width() * s)), target.height());
-        const QImage big = src.scaled(sz, Qt::KeepAspectRatio, Qt::FastTransformation);
-        if (big.width() >= target.width()) {
-            const int dx = (big.width() - target.width()) / 2;
-            return big.copy(dx, 0, target.width(), target.height());
-        }
-        // 宽度不足:居中显示, 左右深色留边
-        QImage canvas(target, QImage::Format_RGB32);
-        canvas.fill(QColor(18, 20, 26));
-        QPainter pa(&canvas);
-        pa.drawImage((target.width() - big.width()) / 2, 0, big);
-        return canvas;
-    };
     const bool framePortrait = frame.height > frame.width;
     // 横屏帧:2 分屏下节流检测左右黑边(竖屏内容), 检测到则铺满前先裁黑边
     QRect barRect(0, 0, frame.width, frame.height);
@@ -574,12 +692,30 @@ void SessionView::renderFrame()
     // 内容为竖屏(帧本身竖屏, 或横屏帧内裁出的内容区竖屏)才铺满
     const bool contentPortrait = framePortrait || barRect.width() < barRect.height();
     const bool fill = m_fillMode && contentPortrait;
-    const bool hasCrop = barRect != QRect(0, 0, frame.width, frame.height);
-    const QImage src = (fill && hasCrop) ? img.copy(barRect) : img;
-    const QImage scaledImg = fill
-        ? scaledToFillHeight(src, m_videoLabel->size())
-        : src.scaled(m_videoLabel->size(), Qt::KeepAspectRatio, Qt::FastTransformation);
-    m_videoLabel->setFrame(QPixmap::fromImage(scaledImg));
+
+    const QSizeF target = m_videoLabel->size();
+    QRectF src(barRect), dst;
+    if (fill) {
+        // 高度优先铺满:高度 100%(上下不裁), 宽度超出才裁左右, 不足居中留边
+        const double s = target.height() / src.height();
+        const double fitW = src.width() * s;
+        if (fitW >= target.width()) {
+            dst = QRectF(0, 0, target.width(), target.height());
+            const double needW = src.width() * target.width() / fitW;
+            const double dx = (src.width() - needW) / 2.0;
+            src = QRectF(src.left() + dx, src.top(), needW, src.height());
+        } else {
+            dst = QRectF((target.width() - fitW) / 2.0, 0, fitW, target.height());
+        }
+    } else {
+        // 等比留边:完整可见, 居中
+        const double s = qMin(target.width() / src.width(),
+                              target.height() / src.height());
+        const double fw = src.width() * s, fh = src.height() * s;
+        dst = QRectF((target.width() - fw) / 2.0,
+                     (target.height() - fh) / 2.0, fw, fh);
+    }
+    m_videoLabel->setFrame(img, src, dst);
     // 分辨率只在速率栏显示(↓↑ Mbps · fps · WxH), 状态文字不重复带
     setStatus(QStringLiteral("接收中"));
 
@@ -620,50 +756,47 @@ void SessionView::renderFrame()
 
 void SessionView::queryNetRate()
 {
-    // 上一次查询还在跑就跳过(避免进程堆积)
-    if (m_netProc && m_netProc->state() != QProcess::NotRunning)
-        return;
-
-    m_netProc = new QProcess(this);
-    connect(m_netProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this](int, QProcess::ExitStatus) {
-        const QString out =
-            QString::fromUtf8(m_netProc->readAllStandardOutput()).trimmed();
-        m_netProc->deleteLater();
-        m_netProc = nullptr;
-
-        // 输出形如 "R=8398" "S=28732"(字节/秒, Get-Counter 实时值, 与任务管理器一致)
-        double rxBps = -1, txBps = -1;
-        const QStringList lines = out.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
-        for (const QString &line : lines) {
-            if (line.startsWith(QLatin1String("R=")))
-                rxBps = line.mid(2).toDouble();
-            else if (line.startsWith(QLatin1String("S=")))
-                txBps = line.mid(2).toDouble();
+    // 原生统计:GetIfTable2 全接口累计字节差分, 得实时速率。
+    // 替代旧的 powershell Get-Counter 方案 —— 每 2.5s 拉一个 powershell
+    // 进程会持续出现在进程列表(还带 conhost)并产生可观的启动 CPU 开销。
+    double rxBps = -1, txBps = -1;
+#ifdef _WIN32
+    MIB_IF_TABLE2 *table = nullptr;
+    if (GetIfTable2(&table) == NO_ERROR && table) {
+        quint64 rx = 0, tx = 0;
+        for (ULONG i = 0; i < table->NumEntries; ++i) {
+            const MIB_IF_ROW2 &r = table->Table[i];
+            if (r.Type == IF_TYPE_SOFTWARE_LOOPBACK)
+                continue;   // 回环不计, 口径与任务管理器一致
+            // InOctets/OutOctets 对部分虚拟接口可能不可用(= -1)
+            if (r.InOctets != MAXULONG64)
+                rx += r.InOctets;
+            if (r.OutOctets != MAXULONG64)
+                tx += r.OutOctets;
         }
-        if (rxBps < 0)
-            return;
-        if (txBps < 0)
-            txBps = 0;
-        const double rxMbps = rxBps * 8.0 / 1e6;
-        const double txMbps = txBps * 8.0 / 1e6;
+        FreeMibTable(table);
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (m_netPrevMs > 0 && now > m_netPrevMs) {
+            const double secs = double(now - m_netPrevMs) / 1000.0;
+            rxBps = double(rx - m_netPrevRx) / secs;   // 无符号差分天然处理 32 位计数回绕
+            txBps = double(tx - m_netPrevTx) / secs;
+        }
+        m_netPrevRx = rx;
+        m_netPrevTx = tx;
+        m_netPrevMs = now;
+    }
+#endif
+    if (rxBps < 0)
+        return;
+    if (txBps < 0)
+        txBps = 0;
+    const double rxMbps = rxBps * 8.0 / 1e6;
+    const double txMbps = txBps * 8.0 / 1e6;
 
-        // 只显示上下行速率(分辨率/帧率由独立标签在 renderFrame 更新)
-        m_rateLabel->setText(QStringLiteral("↓%1 ↑%2 Mbps")
-                                 .arg(rxMbps, 0, 'f', 1)
-                                 .arg(txMbps, 0, 'f', 1));
-    });
-
-    m_netProc->start(
-        QStringLiteral("powershell"),
-        {QStringLiteral("-NoProfile"), QStringLiteral("-Command"),
-         // 全接口求和:网卡实例名不可枚举——LAN 走以太网(i219-v), 安卓 Miracast 走
-         // Wi-Fi Direct 虚拟网卡, 旧过滤 'Wifi|WLAN' 一个都匹配不到导致安卓看不到码率。
-         // 投屏视频流是主机主导流量, 全接口求和即实时链路速率。
-         QStringLiteral("$s = Get-Counter '\\Network Interface(*)\\Bytes Received/sec','\\Network Interface(*)\\Bytes Sent/sec' -ErrorAction Stop | ForEach-Object { $_.CounterSamples }; "
-                        "$r = [math]::Round(($s | Where-Object { $_.Path -match 'Received' } | Measure-Object CookedValue -Sum).Sum); "
-                        "$t = [math]::Round(($s | Where-Object { $_.Path -match 'Sent' } | Measure-Object CookedValue -Sum).Sum); "
-                        "Write-Output ('R=' + $r); Write-Output ('S=' + $t)")});
+    // 只显示上下行速率(分辨率/帧率由独立标签在 renderFrame 更新)
+    m_rateLabel->setText(QStringLiteral("↓%1 ↑%2 Mbps")
+                             .arg(rxMbps, 0, 'f', 1)
+                             .arg(txMbps, 0, 'f', 1));
 }
 
 void SessionView::attachWindow(qulonglong wid)

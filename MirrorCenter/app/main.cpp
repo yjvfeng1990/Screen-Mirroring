@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QSurfaceFormat>
 #include <QFile>
 #include <QDir>
 #include <QTextStream>
@@ -26,6 +27,11 @@ int main(int argc, char *argv[])
 {
     qInstallMessageHandler(logToFile);
     qInfo() << "=== MirrorCenter start ===";
+    // GPU 帧控件(QOpenGLWidget)默认表面格式:Desktop OpenGL 兼容 profile
+    QSurfaceFormat fmt;
+    fmt.setRenderableType(QSurfaceFormat::OpenGL);
+    fmt.setProfile(QSurfaceFormat::CompatibilityProfile);
+    QSurfaceFormat::setDefaultFormat(fmt);
     QApplication app(argc, argv);
     qInfo() << "QApplication created";
     app.setApplicationName("MirrorCenter");

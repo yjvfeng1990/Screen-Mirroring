@@ -9,7 +9,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network Gui)
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network Gui OpenGLWidgets)
 
 # 子目录:core 库 → sdk 库 → app 演示宿主
 add_subdirectory(core)

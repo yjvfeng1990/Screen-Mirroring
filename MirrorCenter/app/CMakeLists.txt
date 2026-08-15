@@ -31,6 +31,7 @@ target_link_libraries(MirrorCenter PRIVATE
     mirrorsdk
     Qt6::Widgets
     Qt6::Network
+    Qt6::OpenGLWidgets
 )
 
 if(WIN32)
