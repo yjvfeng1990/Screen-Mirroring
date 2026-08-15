@@ -13,6 +13,7 @@ class QFrame;
 class QLabel;
 class QTimer;
 class QPixmap;
+class QCloseEvent;
 
 /**
  * 侧边吸附"投屏来源/播放器窗口"面板(参考 TopDesk 侧边栏交互)
@@ -46,6 +47,10 @@ public:
     void setPanelVisible(bool show);
     bool isPanelVisible() const;
 
+public slots:
+    /** 主窗口最小化/还原 → 联动隐藏/还原面板 */
+    void setHostMinimized(bool minimized);
+
 protected:
     void enterEvent(QEnterEvent *event) override;
     void leaveEvent(QEvent *event) override;
@@ -57,7 +62,6 @@ private:
     void expand();
     void collapse();
     void updateDockGeometry();
-    void updateTriggerPosition();
     /** 刷新所有卡片缩略图(节拍触发) */
     void refreshThumbnails();
     /** 列表项被点击(选中置顶) */
@@ -79,16 +83,16 @@ private:
     std::function<QPixmap(const QString &)> m_thumbProvider;
     QTimer *m_thumbTimer = nullptr;            // 缩略图刷新节拍(800ms)
 
-    // 侧边吸附
-    QWidget *m_triggerButton = nullptr;   // 收起时屏幕右边缘的触发条(独立置顶小窗)
-    QTimer  *m_hideTimer     = nullptr;   // 鼠标离开 300ms 后收起
+    // 内嵌面板(作为主窗口子控件): 展开时覆盖主窗口右侧内部, 收起完全隐藏
+    QTimer  *m_hideTimer     = nullptr;   // 鼠标离开面板 300ms 后收起
     bool     m_dockedExpanded = true;     // 当前是否展开
     int      m_panelWidth     = 320;
-    int      m_collapsedWidth = 8;
 
 signals:
     /** 用户请求收起控制台 */
     void hideRequested();
     /** 用户点击列表项:选中该来源窗口, 由 DesktopWindow 置顶 */
     void sourceSelected(const QString &sessionId);
+    /** 用户点击卡片上的"移除"按钮:由 DesktopWindow 断开该设备会话 */
+    void removeRequested(const QString &sessionId);
 };

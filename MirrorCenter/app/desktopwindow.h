@@ -15,6 +15,12 @@ class QGridLayout;
 class QVBoxLayout;
 class QLabel;
 class QFrame;
+class QShowEvent;
+class QHideEvent;
+class QCloseEvent;
+class QResizeEvent;
+class QMoveEvent;
+class QEvent;
 
 /** 投屏来源(供控制台列表展示) */
 struct SourceItem {
@@ -39,6 +45,20 @@ public:
     explicit DesktopWindow(QWidget *parent = nullptr);
     ~DesktopWindow() override;
 
+protected:
+    // 启动闪烁诊断: 记录 show/hide 事件序列
+    void showEvent(QShowEvent *e) override;
+    void hideEvent(QHideEvent *e) override;
+    // HWND 重建诊断: createWinId 后若 winId 变化说明原生窗口被销毁重建
+    bool event(QEvent *e) override;
+    // 主窗口移动/跨屏 → 联动各视图的信息栏重定位(信息栏是独立顶层窗)
+    void moveEvent(QMoveEvent *e) override;
+    // 主窗口关闭 → 通知 main 联动关闭控制面板
+    void closeEvent(QCloseEvent *e) override;
+    // 最小化/还原 → 联动隐藏/还原控制面板与触发条
+    void changeEvent(QEvent *e) override;
+
+public:
     /** 添加会话 */
     SessionView *addSession(const QString &name, mirror_backend_t backend);
 
@@ -62,8 +82,17 @@ public slots:
     void startAirPlay();
     void startMiracast();
     void startMiceBackend();
+    /**
+     * 预创建 Miracast 占位视图(4 路槽位, 不启动服务)。
+     * 必须在窗口显示前调用: QOpenGLWidget 在已显示窗口上动态创建会触发
+     * 父窗口 HWND 重建(Qt6 行为), 表现为"窗口打开后又消失重显"。
+     * 视图先在离屏预渲染阶段就绪, startMiracast 仅接管 SDK 句柄。
+     */
+    void createMiracastPlaceholders();
     void toggleFullscreen();
     void onSessionClosed(const QString &sessionId);
+    /** 控制台"移除投屏设备":网关会话先断开设备再清理视图 */
+    void removeSession(const QString &sessionId);
     /** 控制台选中某来源 → 把它排到主窗口首位 */
     void focusSession(const QString &sessionId);
 
@@ -104,6 +133,7 @@ protected:
     QLabel         *m_emptyLabel    = nullptr;
     QGridLayout    *m_grid          = nullptr;
     QToolButton    *m_toggleCtrlBtn = nullptr;  // "显示控制台"小按钮
+    QWidget        *m_sideTrigger   = nullptr;  // 主窗口右缘内侧触发条(替代原悬浮条)
     QList<SessionView *> m_views;
     SessionView *m_focusView = nullptr;   // 独占全屏的会话视图(非空时只显示它)
     int  m_layoutMode = 0;   // 0=按会话数自动(1全屏/2左右/3+四宫格), 1/2/3/4/6=手动覆盖
@@ -112,6 +142,7 @@ protected:
     bool m_miceStarted     = false;   // MS-MICE 接收端已启动(幂等)
     QString m_decoder;                 // 实例上报的实际视频解码器(空=未知)
     int  m_maxGrid = 16;               // 根据解码器限定的最大格数(软解4/硬解16)
+    WId  m_lastWinId = 0;              // 上次 winId(诊断 HWND 重建)
 
     // 上次布局状态(快速路径:无变化则跳过重排, 避免切换闪烁)
     QList<SessionView *> m_lastShown;
@@ -129,6 +160,9 @@ public:
     void showToggleCtrlBtn(bool show);
     QToolButton *toggleCtrlButton() const { return m_toggleCtrlBtn; }
 
+protected:
+    bool eventFilter(QObject *obj, QEvent *event) override;
+
 signals:
     void sessionCountChanged(int n);
     void statusMessage(const QString &msg);
@@ -136,4 +170,10 @@ signals:
     void sourcesChanged();
     /** 用户点击了"显示控制台"小按钮(由 ControlPanel 监听) */
     void requestShowControlPanel();
+    /** 主窗口关闭请求(由 main 联动关闭控制面板) */
+    void closeRequested();
+    /** 主窗口最小化状态变化(由 main 联动隐藏/还原控制面板) */
+    void windowMinimizedChanged(bool minimized);
+    /** 主窗口右缘触发条被悬停/点击(由 main 展开控制面板) */
+    void sideTriggerActivated();
 };

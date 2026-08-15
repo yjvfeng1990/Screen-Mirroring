@@ -613,6 +613,25 @@ QStatusBar::item {
     border-radius: 6px;
 }
 
+/* 卡片上的"移除投屏设备"按钮 */
+#srcItemRemoveBtn {
+    background-color: transparent;
+    color: #6B7488;
+    border: none;
+    border-radius: 6px;
+    font-size: 12px;
+}
+
+#srcItemRemoveBtn:hover {
+    background-color: rgba(231, 76, 60, 0.25);
+    color: #FF6B6B;
+}
+
+#srcItemRemoveBtn:pressed {
+    background-color: rgba(231, 76, 60, 0.40);
+    color: #FFFFFF;
+}
+
 #ctrlPanelEmpty {
     color: #6B7488;
     font-size: 13px;

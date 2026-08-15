@@ -71,6 +71,9 @@ public:
     bool isGatewayMode() const { return m_gatewayMode; }
     mirror_session_t *sdkSession() const { return m_sdkSession; }
 
+    /** 信息栏相对本视图重定位(主窗口移动/跨屏时由 DesktopWindow 调用) */
+    void refreshInfoBadge() { updateInfoBadge(); }
+
     /** 网关模式:包装 SDK 已建好的会话句柄(由 on_client_connected 回调提供) */
     void adoptGatewaySession(mirror_session_t *sdkSession, const QString &clientIp);
     /** 手动会话:接管 SDK 已创建好的会话句柄(多路 Miracast 组用, 视图拥有句柄) */
@@ -79,8 +82,16 @@ public:
     void stop();
     /** 设备断开:移除窗口嵌入(视图随后由 DesktopWindow 删除) */
     void detach();
+    /** 主动清空画面回占位等待(移除投屏源/帧链路断开时用)。
+     *  不依赖服务端断链回调时序 —— 宿主发起移除后立即调用, 画面即刻消失。 */
+    void resetToWaiting();
     /** 由 DesktopWindow 通知当前是否独占全屏(切换按钮图标) */
     void setFullscreenActive(bool active);
+    /** 全屏联动静音: 焦点路 false(出声), 其余路 true(静音)。
+     *  Miracast 按连接 SETMUTE, AirPlay/MICE 按进程 PID。 */
+    void setMuted(bool mute);
+    /** 当前是否处于静音状态 */
+    bool isMuted() const { return m_muted; }
     /** 由 DesktopWindow 通知当前是否铺满整格(≥2 路分屏:覆盖裁剪, 无黑边);
      *  false = 独立等比显示完整画面(留边)。 */
     void setFillMode(bool on);
@@ -102,6 +113,8 @@ signals:
     void firstFrameReceived();
     /** 帧链路断开(设备退出):画面已清空, 回到等待状态(通知主窗口重排/刷新列表) */
     void firstFrameCleared();
+    /** 设备真实名称已上报(服务端经帧通道 MCCTRL1 NAME: 送达) */
+    void clientNameChanged(const QString &name);
 
 protected:
     void moveEvent(QMoveEvent *e) override;
@@ -118,11 +131,6 @@ private:
     void attachWindow(qulonglong wid);
     void setStatus(const QString &s);
     void renderFrame();
-    /**
-     * 检测横屏帧内左右黑边(安卓 Miracast 流恒横屏, 竖屏内容在帧内居中带左右黑边)。
-     * 检测到且内容区为竖屏返回内容矩形; 无黑边/内容非竖屏返回整帧。
-     */
-    QRect detectSideBars(const QImage &img);
     /** 周期查询 Wifi 网卡性能计数器, 差分显示源网络实时接收/发送速率 */
     void queryNetRate();
     /** AirPlay 帧率/分辨率估算:窗口内容变化检测 + 客户区尺寸(无帧回调时用) */
@@ -135,6 +143,8 @@ private:
     void updateInfoBadge();
     /** 静音/取消静音(按会话后端子进程 PID 控制音频会话) */
     void toggleMute();
+    /** 执行静音/取消静音: Miracast 按连接 SETMUTE, 其它按进程 PID。返回是否成功。 */
+    bool applyMute(bool mute);
     /** 全屏/还原 */
     void toggleFullscreen();
 
@@ -143,6 +153,8 @@ private:
     static void onWindowCallback(mirror_session_t *session, uint64_t handle, void *userdata);
     static void onLogCallback(mirror_session_t *session, const char *message, void *userdata);
     static void onFrameCallback(mirror_session_t *session, void *userdata);
+    static void onClientInfoCallback(mirror_session_t *session, const char *name,
+                                     const char *model, void *userdata);
 
     QString m_sessionId;
     QString m_deviceName;
@@ -190,6 +202,4 @@ private:
     bool m_framePending = false;         // 上一帧是否还没在 UI 线程渲染完(节流用)
     bool m_hasFirstFrame = false;        // 是否已收到首帧(Miracast 占位会话据此隐藏)
     bool m_fillMode = false;             // 铺满整格:等比放大覆盖后居中裁剪(无黑边)
-    qint64 m_lastBarCheck = 0;           // 黑边检测节流时间戳(ms)
-    QRect  m_lastBarRect;                // 最近一次黑边检测结果(整帧=无竖屏黑边)
 };

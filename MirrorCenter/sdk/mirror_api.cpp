@@ -234,6 +234,15 @@ static void dispatchFrame(mirror_session_t *h)
         h->cbs.on_frame(h, h->userdata);
 }
 
+static void dispatchClientInfo(mirror_session_t *h, const QString &name, const QString &model)
+{
+    if (!h || !h->cbs.on_client_info)
+        return;
+    const QByteArray nameUtf8 = name.toUtf8();
+    const QByteArray modelUtf8 = model.toUtf8();
+    h->cbs.on_client_info(h, nameUtf8.constData(), modelUtf8.constData(), h->userdata);
+}
+
 /* ============ 网关辅助 ============ */
 
 static mirror_session_t *findHandleForCore(MirrorSession *core)
@@ -544,6 +553,18 @@ MIRROR_API mirror_result_t mirror_init(void)
                 lock.unlock();
                 dispatchFrame(h);
                 lock.relock();
+                break;
+            }
+        }
+    }, Qt::QueuedConnection);
+
+    QObject::connect(g_manager, &SessionManager::sessionClientInfo,
+                     g_manager, [](const QString &id, const QString &name, const QString &model) {
+        QMutexLocker lock(&g_mutex);
+        for (auto *h : g_sessions.keys()) {
+            if (h->core && h->core->id() == id) {
+                lock.unlock();
+                dispatchClientInfo(h, name, model);
                 break;
             }
         }
@@ -1164,6 +1185,31 @@ MIRROR_API mirror_result_t mirror_set_frame_edge(mirror_session_t *session, int 
         QMutexLocker lock(&g_mutex);
         session->frameEdgeOverride = edge;
     }
+    return MIRROR_OK;
+}
+
+MIRROR_API mirror_result_t mirror_set_session_mute(mirror_session_t *session, bool mute)
+{
+    if (!session || !isHandleValid(session))
+        return MIRROR_ERR_INVALID_ARG;
+    // Miracast(有 FrameClient): 按连接 SETMUTE, 组内各路独立静音。
+    // AirPlay/MICE 无 FrameClient: 由宿主按进程 PID 静音(uxplay 每实例独立进程),
+    // 此处仅记录意图(宿主全屏联动时用 mirror_get_process_id 走 WASAPI)。
+    if (session->core)
+        session->core->setTargetMute(mute);
+    else
+        session->frameFpsOverride = mute;   // 借用字段记录静音意图(不实际生效)
+    return MIRROR_OK;
+}
+
+MIRROR_API mirror_result_t mirror_set_session_disconnect(mirror_session_t *session)
+{
+    if (!session || !isHandleValid(session))
+        return MIRROR_ERR_INVALID_ARG;
+    // 仅 Miracast(有 FrameClient)支持: 发 SETDISC 断开本路连接, 服务进程保留。
+    // AirPlay/MICE 无 FrameClient: 无操作。
+    if (session->core)
+        session->core->setTargetDisconnect();
     return MIRROR_OK;
 }
 

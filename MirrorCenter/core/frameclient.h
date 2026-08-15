@@ -46,6 +46,14 @@ public:
     /// 宿主按总活跃路数(含 AirPlay)计算, 覆盖服务端按自身连接数的默认分档。
     void setTargetEdge(int edge);
 
+    /// 全屏放大场景: 向接收服务发送 "SETMUTE 0/1"(按连接静音/取消静音)。
+    /// Miracast 组共享同一接收进程, 不能按进程静音(会误伤组内焦点路)。
+    void setTargetMute(bool mute);
+
+    /// 移除投屏源: 向接收服务发送 "SETDISC", 请求断开本连接(仅本路)。
+    /// 服务端 MiracastReceiverConnection.Disconnect → 本路清理, 进程与其余路保留。
+    void setTargetDisconnect();
+
 signals:
     /// 监听就绪(可接受连接)
     void connected();
@@ -53,6 +61,8 @@ signals:
     void clientConnected();
     void disconnected();
     void frameReady();
+    /// 服务端控制消息:设备名(真实投屏设备名, 如 "Honor 10")
+    void deviceNameReceived(const QString &name);
 
 private slots:
     void onNewConnection();
@@ -61,6 +71,7 @@ private slots:
 
 private:
     bool tryParseFrame();
+    void handleControlMessage(const QByteArray &line);
 
     QPointer<QTcpServer> m_server;
     QPointer<QTcpSocket> m_socket;

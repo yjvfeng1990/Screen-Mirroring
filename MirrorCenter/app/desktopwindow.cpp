@@ -1,6 +1,10 @@
 #include "desktopwindow.h"
 #include "sessionview.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <QGridLayout>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -14,6 +18,8 @@
 #include <QAbstractSocket>
 #include <QTimer>
 #include <QDebug>
+#include <QEvent>
+#include <QMoveEvent>
 #include <QMouseEvent>
 #include <QMetaObject>
 #include <QFile>
@@ -26,6 +32,13 @@ DesktopWindow::DesktopWindow(QWidget *parent)
     resize(1280, 800);
     setMinimumSize(800, 500);
     // 黑底:投屏画面的最佳承载背景
+    // 用 QPalette(首帧前即生效)而非 QSS(渲染管线首帧才应用),
+    // 否则窗口打开瞬间会先以系统默认浅色背景闪一帧。
+    QPalette pal = palette();
+    pal.setColor(QPalette::Window, QColor(0, 0, 0));
+    setPalette(pal);
+    setAutoFillBackground(true);
+    setAttribute(Qt::WA_OpaquePaintEvent);
     setStyleSheet("background-color: #000000;");
 
     buildUi();
@@ -44,6 +57,90 @@ DesktopWindow::~DesktopWindow()
 {
     for (SessionView *view : m_views)
         view->stop();
+}
+
+// 启动闪烁诊断: 记录主窗口 show/hide 事件序列, 确认是否存在
+// "show → hide → show" 的原生窗口重建循环。
+void DesktopWindow::showEvent(QShowEvent *e)
+{
+    QWidget::showEvent(e);
+    qInfo() << "[win] DesktopWindow showEvent, visible=" << isVisible();
+}
+
+void DesktopWindow::hideEvent(QHideEvent *e)
+{
+    QWidget::hideEvent(e);
+    qInfo() << "[win] DesktopWindow hideEvent";
+}
+
+// HWND 重建诊断: Qt 会在原生窗口需要重建时先销毁再创建, 触发 WinIdChange。
+// 现象"窗口已打开又消失重显"若由此引起, 这里能打印 winId 变化时刻,
+// 配合 show/hide 日志判断重建发生于何时、由什么触发。
+bool DesktopWindow::event(QEvent *e)
+{
+    if (e->type() == QEvent::WinIdChange) {
+        const WId cur = winId();
+        qInfo() << "[win] WinIdChange:" << m_lastWinId << "->" << cur
+                << " visible=" << isVisible();
+        m_lastWinId = cur;
+#ifdef _WIN32
+        // 打印调用栈(模块+偏移), 定位是谁触发了原生窗口重建
+        void *frames[24] = {};
+        USHORT n = CaptureStackBackTrace(0, 24, frames, nullptr);
+        qInfo() << "[win] rebuild stack frames:" << n;
+        for (USHORT i = 0; i < n; ++i) {
+            HMODULE mod = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                               | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(frames[i]), &mod);
+            wchar_t name[MAX_PATH] = {};
+            if (mod && GetModuleFileNameW(mod, name, MAX_PATH)) {
+                const wchar_t *base = wcsrchr(name, L'\\');
+                base = base ? base + 1 : name;
+                qInfo() << "    " << QString::fromWCharArray(base)
+                        << "+0x" << QString::number(
+                            reinterpret_cast<quintptr>(frames[i])
+                            - reinterpret_cast<quintptr>(mod), 16);
+            } else {
+                qInfo() << "    0x" << QString::number(
+                    reinterpret_cast<quintptr>(frames[i]), 16);
+            }
+        }
+#endif
+    }
+    return QWidget::event(e);
+}
+
+void DesktopWindow::moveEvent(QMoveEvent *e)
+{
+    QWidget::moveEvent(e);
+    // 信息栏是独立顶层窗: 主窗口移动/跨屏时视图相对位置不变(子控件不触发 moveEvent),
+    // 必须在这里联动所有视图的信息栏重定位, 保证信息栏相对主窗口显示。
+    for (SessionView *view : m_views)
+        view->refreshInfoBadge();
+}
+
+void DesktopWindow::closeEvent(QCloseEvent *e)
+{
+    qInfo() << "[win] DesktopWindow closeEvent";
+    // 联动关闭控制面板(含独立触发条窗口)
+    emit closeRequested();
+    QWidget::closeEvent(e);
+}
+
+void DesktopWindow::changeEvent(QEvent *e)
+{
+    QWidget::changeEvent(e);
+    if (e->type() != QEvent::WindowStateChange)
+        return;
+    // 最小化/还原 → 通知 main 联动隐藏/还原控制面板与触发条
+    static bool lastMinimized = false;
+    const bool minimized = isMinimized();
+    if (minimized != lastMinimized) {
+        lastMinimized = minimized;
+        qInfo() << "[win] DesktopWindow minimized=" << minimized;
+        emit windowMinimizedChanged(minimized);
+    }
 }
 
 void DesktopWindow::buildUi()
@@ -118,14 +215,32 @@ void DesktopWindow::buildUi()
     m_toggleCtrlBtn->setFixedSize(120, 32);
     m_toggleCtrlBtn->hide();
     m_toggleCtrlBtn->raise();
+
+    // ---- 右缘内侧触发条(替代原独立悬浮触发条窗口) ----
+    // 嵌入主窗口, 随主窗口最小化/关闭一起隐藏, 不再悬浮桌面
+    m_sideTrigger = new QWidget(this);
+    m_sideTrigger->setFixedSize(10, 48);
+    m_sideTrigger->setStyleSheet(
+        "background-color:#20242E; border-top-left-radius:5px;"
+        "border-bottom-left-radius:5px;");
+    m_sideTrigger->setCursor(Qt::PointingHandCursor);
+    m_sideTrigger->setToolTip(QStringLiteral("展开播放器窗口面板"));
+    m_sideTrigger->installEventFilter(this);
+    m_sideTrigger->show();
+    m_sideTrigger->raise();
 }
 
 void DesktopWindow::resizeEvent(QResizeEvent *e)
 {
     QWidget::resizeEvent(e);
+    qInfo() << "[win] DesktopWindow resizeEvent" << e->size();
     if (m_toggleCtrlBtn && !m_toggleCtrlBtn->isHidden()) {
         m_toggleCtrlBtn->move(width() - m_toggleCtrlBtn->width() - 16,
                               height() - m_toggleCtrlBtn->height() - 16);
+    }
+    if (m_sideTrigger) {
+        m_sideTrigger->move(width() - m_sideTrigger->width() - 4,
+                            (height() - m_sideTrigger->height()) / 2);
     }
 }
 
@@ -303,9 +418,14 @@ void DesktopWindow::onViewFullscreen(const QString &sessionId)
         mirror_session_t *s = v->sdkSession();
         if (!s)
             continue;
-        const bool isFocus = (m_focusView == v);
-        mirror_set_frame_fps(s, isFocus ? 0 : 1);
+        // 无焦点(还原)或本路即焦点 → 满帧(0=默认); 其余路 → 1fps
+        mirror_set_frame_fps(s, (m_focusView && m_focusView != v) ? 1 : 0);
     }
+
+    // 全屏联动静音: 焦点路出声, 其余被遮住的路静音(避免多路音频混杂);
+    // 还原后全部恢复出声。Miracast 按连接 SETMUTE, AirPlay/MICE 按进程 PID。
+    for (SessionView *v : m_views)
+        v->setMuted(m_focusView != nullptr && m_focusView != v);
 
     relayout();
 }
@@ -337,27 +457,14 @@ void DesktopWindow::startAirPlay()
     emit statusMessage(QStringLiteral("AirPlay 接收已启动(MirrorCenter, 多设备自动调度)"));
 }
 
-void DesktopWindow::startMiracast()
+void DesktopWindow::createMiracastPlaceholders()
 {
-    if (m_miracastStarted) return;
-    m_miracastStarted = true;
-
     // 4 路 Miracast 槽位:Windows.Media.Miracast 原生支持多路同时连接,
     // 单服务进程承载全部连接, 每路独立帧端口。实际并发路数受网卡驱动硬件
     // 上限(MiracastReceiverStatus.MaxSimultaneousConnections)约束。
+    // 视图在窗口显示前创建(见头文件注释), 防止 QOpenGLWidget 触发 HWND 重建。
     constexpr int kMiracastSlots = 4;
-    mirror_session_t *sessions[8] = {};
-    int count = 0;
-    const mirror_result_t rc = mirror_start_miracast_group(
-        kMiracastSlots, "MirrorCenter", nullptr, sessions, &count);
-    if (rc != MIRROR_OK || count <= 0) {
-        m_miracastStarted = false;
-        emit statusMessage(QStringLiteral("Miracast 启动失败: %1")
-                               .arg(QString::fromUtf8(mirror_last_error())));
-        return;
-    }
-
-    for (int i = 0; i < count; ++i) {
+    for (int i = 0; i < kMiracastSlots; ++i) {
         const QString name = QStringLiteral("Miracast-%1").arg(i + 1);
         // deferStart=true:会话由 SDK 组 API 创建, 视图只接管句柄(adoptManualSession)
         auto *view = new SessionView(name, MIRROR_BACKEND_MIRACAST, m_canvasInner,
@@ -371,13 +478,49 @@ void DesktopWindow::startMiracast()
             relayout();
             emit sourcesChanged();
         });
+        // 设备名就绪(服务端上报真实名) → 刷新控制面板列表
+        connect(view, &SessionView::clientNameChanged, this, [this]() {
+            emit sourcesChanged();
+        });
         // 帧链路断开(设备退出):画面清空回到等待 → 重排/刷新列表
         connect(view, &SessionView::firstFrameCleared, this, [this]() {
             relayout();
             emit sourcesChanged();
         });
-        view->adoptManualSession(sessions[i], name);
         m_views.append(view);
+    }
+    emit sourcesChanged();
+}
+
+void DesktopWindow::startMiracast()
+{
+    if (m_miracastStarted) return;
+    m_miracastStarted = true;
+
+    // 视图必须在窗口显示前由 createMiracastPlaceholders 创建完毕
+    // (QOpenGLWidget 在已显示窗口动态创建会重建父 HWND → 窗口闪两次);
+    // 这里只启动共享服务进程并给已有视图接管 SDK 句柄。
+    mirror_session_t *sessions[8] = {};
+    int count = 0;
+    const mirror_result_t rc = mirror_start_miracast_group(
+        4, "MirrorCenter", nullptr, sessions, &count);
+    if (rc != MIRROR_OK || count <= 0) {
+        m_miracastStarted = false;
+        emit statusMessage(QStringLiteral("Miracast 启动失败: %1")
+                               .arg(QString::fromUtf8(mirror_last_error())));
+        return;
+    }
+
+    // 按创建顺序接管句柄;视图已存在, 只 adopt
+    int slot = 0;
+    for (SessionView *view : m_views) {
+        if (view->backend() != MIRROR_BACKEND_MIRACAST)
+            continue;
+        if (slot >= count)
+            break;
+        view->adoptManualSession(sessions[slot],
+                                 QStringLiteral("Miracast-%1").arg(slot + 1));
+        ++slot;
     }
     emit statusMessage(QStringLiteral("Miracast 接收已启动(%1 路槽位)").arg(count));
     relayout();
@@ -420,6 +563,10 @@ SessionView *DesktopWindow::addSession(const QString &name, mirror_backend_t bac
     // 首帧前保持隐藏(Miracast 占位会话);收到首帧才在主窗口/列表出现
     connect(view, &SessionView::firstFrameReceived, this, [this]() {
         relayout();
+        emit sourcesChanged();
+    });
+    // 设备名就绪(服务端上报真实名) → 刷新控制面板列表
+    connect(view, &SessionView::clientNameChanged, this, [this]() {
         emit sourcesChanged();
     });
     m_views.append(view);
@@ -478,6 +625,56 @@ void DesktopWindow::focusSession(const QString &sessionId)
             return;
         }
     }
+}
+
+void DesktopWindow::removeSession(const QString &sessionId)
+{
+    // 先找到目标视图(取其句柄/网关信息)
+    SessionView *target = nullptr;
+    for (SessionView *v : m_views) {
+        if (v->sessionId() == sessionId) { target = v; break; }
+    }
+    if (!target)
+        return;
+
+    // 网关模式(AirPlay / MICE): 视图只解除嵌入, 设备连接由 SDK 持有。
+    // 移除设备需先真正断开, 否则设备仍连着、画面继续解码消耗 CPU。
+    // 用 mirror_stop_session 通知后端停止该会话, 网关在设备断开后回收实例。
+    if (target->isGatewayMode()) {
+        if (mirror_session_t *s = target->sdkSession())
+            mirror_stop_session(s);
+        onSessionClosed(sessionId);
+        return;
+    }
+
+    // Miracast 组: 所有路共享同一接收服务进程。移除单个投屏源只断开目标路的
+    // 连接(宿主经帧通道发 SETDISC → 服务端 MiracastReceiverConnection.Disconnect),
+    // 服务进程与其余路全部保留 —— 目标视图回到占位等待, 新设备可复用该槽位。
+    // 绝不能走 onSessionClosed 的整组关闭: 它会销毁主会话句柄 → core->stop()
+    // 杀掉共享服务进程, 其余在投连接随进程一起消失(2026-08-15 崩溃根因)。
+    if (target->backend() == MIRROR_BACKEND_MIRACAST) {
+        // 焦点路被移除: 先退出独占全屏, 恢复其余被静音/限帧的路
+        if (m_focusView == target) {
+            target->setFullscreenActive(false);
+            m_focusView = nullptr;
+            for (SessionView *v : m_views) {
+                if (v == target)
+                    continue;
+                v->setMuted(false);
+                if (mirror_session_t *s = v->sdkSession())
+                    mirror_set_frame_fps(s, 0);
+            }
+        }
+        if (mirror_session_t *s = target->sdkSession())
+            mirror_set_session_disconnect(s);
+        // 立即清空目标视图画面回占位等待(不依赖服务端断链回调时序:
+        // SETDISC → 服务端断开连接 → 帧通道关闭, 该回调才触发, 存在时延/状态拦截)
+        target->resetToWaiting();
+        return;
+    }
+
+    // 其它(独立自建会话): 关闭该会话
+    onSessionClosed(sessionId);
 }
 
 /* ---- 网关回调(SDK 事件线程) ---- */
@@ -595,6 +792,10 @@ void DesktopWindow::onGatewayClientConnected(mirror_session_t *session, const QS
             this, &DesktopWindow::onSessionClosed);
     connect(view, &SessionView::fullscreenRequested,
             this, &DesktopWindow::onViewFullscreen);
+    // 设备名就绪(网关上报真实名) → 刷新控制面板列表
+    connect(view, &SessionView::clientNameChanged, this, [this]() {
+        emit sourcesChanged();
+    });
 
     view->adoptGatewaySession(session, displayName);
     m_views.append(view);
@@ -656,6 +857,16 @@ void DesktopWindow::onSessionClosed(const QString &sessionId)
             m_focusView = nullptr;
     }
 
+    // 焦点路被移除(全屏放大被关闭): 其余被静音的路恢复出声, 帧率恢复默认
+    if (!m_focusView) {
+        for (SessionView *v : m_views) {
+            v->setMuted(false);
+            mirror_session_t *s = v->sdkSession();
+            if (s)
+                mirror_set_frame_fps(s, 0);
+        }
+    }
+
     // 已无 Miracast 视图 → 允许重新启动整组
     bool hasMira = false;
     for (SessionView *v : m_views)
@@ -692,4 +903,17 @@ void DesktopWindow::showToggleCtrlBtn(bool show)
     } else {
         m_toggleCtrlBtn->hide();
     }
+}
+
+bool DesktopWindow::eventFilter(QObject *obj, QEvent *event)
+{
+    // 主窗口右缘触发条: 悬停或点击 → 展开控制面板
+    if (obj == m_sideTrigger) {
+        if (event->type() == QEvent::Enter
+            || event->type() == QEvent::MouseButtonPress) {
+            emit sideTriggerActivated();
+        }
+        return false;
+    }
+    return QWidget::eventFilter(obj, event);
 }

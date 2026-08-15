@@ -34,6 +34,11 @@ GLFrameSurface::GLFrameSurface(QWidget *parent)
     : QOpenGLWidget(parent)
 {
     setAutoFillBackground(false);
+    // GL 上下文就绪前的首帧也保持黑底(避免启动瞬间白闪)
+    QPalette pal = palette();
+    pal.setColor(QPalette::Window, QColor(0, 0, 0));
+    setPalette(pal);
+    setAttribute(Qt::WA_OpaquePaintEvent);
 }
 
 GLFrameSurface::~GLFrameSurface()
@@ -98,8 +103,15 @@ void GLFrameSurface::setFrame(const QImage &img, const QRectF &src, const QRectF
 void GLFrameSurface::clearFrame()
 {
     makeCurrent();
-    if (m_tex)
+    if (m_tex) {
+        // 必须彻底删除对象:只 destroy() 会留下"对象在、GPU 资源已释放"的悬空纹理,
+        // 新设备重新投屏时 setFrame() 对悬空纹理调 width()/setData() → Qt6OpenGL
+        // 访问违规崩溃(2026-08-16 实测:移除一路后重投, 宿主 0xc0000005)。
+        // 删对象后 setFrame() 走 if(!m_tex) 分支重建完整纹理。
         m_tex->destroy();
+        delete m_tex;
+        m_tex = nullptr;
+    }
     doneCurrent();
     m_src = m_dst = QRectF();
     update();
@@ -237,8 +249,10 @@ void SessionView::buildUi()
         layout->addWidget(m_videoLabel, 0, 0);
     }
 
-    // 悬浮信息标签:独立顶层无边框小窗, 悬浮在画面左上角。
-    // 必须用顶层窗: 嵌入的 D3D11 视频是原生 HWND, 会盖住普通 Qt 子控件。
+    // 信息标签:独立顶层小窗(每个播放窗口一个), 叠加在画面左上角。
+    // 必须是顶层窗: 嵌入的 D3D11 视频是原生 HWND, 会盖住普通 Qt 子控件。
+    // 跟随主窗口靠事件联动(DesktopWindow::moveEvent → refreshInfoBadge 重定位),
+    // 主窗口最小化/还原由 SessionView 的 hideEvent/showEvent 同步隐藏/恢复。
     m_infoBadge = new QWidget;
     m_infoBadge->setWindowFlags(Qt::FramelessWindowHint | Qt::Tool
                                 | Qt::WindowStaysOnTopHint | Qt::BypassWindowManagerHint);
@@ -341,6 +355,7 @@ void SessionView::attachCallbacks()
     cbs.on_window = &SessionView::onWindowCallback;
     cbs.on_log    = &SessionView::onLogCallback;
     cbs.on_frame  = &SessionView::onFrameCallback;
+    cbs.on_client_info = &SessionView::onClientInfoCallback;
     mirror_set_callbacks(m_sdkSession, &cbs, this);
 }
 
@@ -406,6 +421,28 @@ void SessionView::stop()
     m_running = false;
 }
 
+void SessionView::resetToWaiting()
+{
+    // 清空画面与活跃标记, 回到占位等待(会话保留, 新设备连入后可复用槽位)
+    if (m_videoLabel)
+        m_videoLabel->clearFrame();
+    m_hasFirstFrame = false;
+    m_lastThumb = QPixmap();
+    // 静音状态重置: 静音是按连接生效的(SETMUTE), 连接断开/移除后旧静音不会
+    // 继承到新连接 —— 若不重置, 重新投屏时按钮残留静音图标但实际正常出声。
+    m_muted = false;
+    if (m_muteBtn)
+        m_muteBtn->setText(QStringLiteral("🔊"));
+    // AirPlay 断开:停止内容变化检测与速率查询, 避免空抓取空耗
+    m_airStatsTimer.stop();
+    m_airChanged = 0;
+    m_airSamples = 0;
+    m_hasAirPrevFp = false;
+    m_netTimer.stop();
+    emit firstFrameCleared();
+    updateInfoBadge();   // 无内容了:悬浮窗随之隐藏
+}
+
 void SessionView::detach()
 {
     // 移除嵌入的视频窗口容器(视图随后由 DesktopWindow 删除)
@@ -464,18 +501,7 @@ void SessionView::onStateCallback(mirror_session_t *session, mirror_state_t stat
         if (state == MIRROR_STATE_STARTING) {
             // 帧链路断开(投屏设备退出):清空画面与活跃标记, 回到占位等待。
             // 会话保留(多路 Miracast 服务进程共享), 新设备连入后帧回调重新出画。
-            if (self->m_videoLabel)
-                self->m_videoLabel->clearFrame();
-            self->m_hasFirstFrame = false;
-            self->m_lastThumb = QPixmap();
-            // AirPlay 断开:停止内容变化检测与速率查询, 避免空抓取空耗
-            self->m_airStatsTimer.stop();
-            self->m_airChanged = 0;
-            self->m_airSamples = 0;
-            self->m_hasAirPrevFp = false;
-            self->m_netTimer.stop();
-            emit self->firstFrameCleared();
-            self->updateInfoBadge();   // 无内容了:悬浮窗随之隐藏
+            self->resetToWaiting();
         } else if (state == MIRROR_STATE_CLOSED) {
             emit self->sessionClosed(self->m_sessionId);
         }
@@ -623,40 +649,34 @@ void SessionView::setFillMode(bool on)
     m_fillMode = on;
 }
 
-QRect SessionView::detectSideBars(const QImage &img)
+// 判断横屏帧左右边缘是否有足够宽的纯黑边(安卓竖屏投屏的特征)。
+// 只判断"有无黑边", 不做内容边界采样 → 内容深色不会被误判裁切。
+// 要求: 左右各至少 minBlack 列连续近黑(平均亮度<16), 双侧同时成立才视为竖屏内容。
+static bool hasSideBars(const QImage &img)
 {
     const int w = img.width(), h = img.height();
-    if (w <= 0 || h <= 0 || img.format() != QImage::Format_RGB32)
-        return QRect(0, 0, w, h);
-    // 取 4 条水平采样线(避开顶部/底部可能的状态/控制区)
-    const int rows[4] = { h * 3 / 16, h * 5 / 16, h * 11 / 16, h * 13 / 16 };
-    const int step = 8;     // 列采样步长
-    const int darkTh = 24;  // 亮度阈值(0-255), 平均低于此视为黑边
+    if (w < 64 || h < 16 || img.format() != QImage::Format_RGB32)
+        return false;
+    const int rows[3] = { h * 3 / 8, h / 2, h * 5 / 8 };
+    const int minBlack = qMax(16, w / 12);   // 单侧黑边最小宽度(约帧宽 8%)
+    const int darkTh = 16;                    // 近黑亮度阈值
     auto colDark = [&](int x) {
         int sum = 0;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 3; ++i) {
             const uchar *p = img.constScanLine(rows[i]) + x * 4;  // BGRA
             sum += (p[2] + p[1] + p[0]) / 3;
         }
-        return sum / 4 < darkTh;
+        return sum / 3 < darkTh;
     };
-    // 从左往右找内容左边界
-    int left = 0;
-    for (int x = 0; x < w; x += step) {
-        if (!colDark(x)) { left = x; break; }
-        left = x;
+    int lb = 0;
+    for (int x = 0; x < w / 2; ++x) {
+        if (colDark(x)) ++lb; else break;
     }
-    // 从右往左找内容右边界
-    int right = w - 1;
-    for (int x = w - 1; x >= 0; x -= step) {
-        if (!colDark(x)) { right = x; break; }
-        right = x;
+    int rb = 0;
+    for (int x = w - 1; x > w / 2; --x) {
+        if (colDark(x)) ++rb; else break;
     }
-    const int cw = right - left + 1;
-    // 黑边合计不足 1/8 宽度, 或内容区不高于宽(非竖屏内容), 视为无竖屏黑边 → 返回整帧
-    if (cw <= 0 || cw >= w - w / 8 || cw >= h)
-        return QRect(0, 0, w, h);
-    return QRect(left, 0, cw, h);
+    return lb >= minBlack && rb >= minBlack;
 }
 
 void SessionView::renderFrame()
@@ -687,27 +707,19 @@ void SessionView::renderFrame()
     // ---- 布局计算:缩放/裁切/留边全部由 GPU 完成, CPU 仅算矩形 ----
     // 铺满仅用于 2 分屏:竖屏视频铺满格子, 横屏视频保持原比例(完整可见);
     // 其它分屏(1 屏/3 屏以上)一律保持原比例。只看视频方向, 与格子方向无关。
-    // 安卓 Miracast 流恒横屏(如 1920x1080), 竖屏内容在帧内居中带左右黑边,
-    // 通过 detectSideBars 裁出竖屏内容区后同样铺满; 真横屏内容不变。
     // 铺满采用"高度优先":高度 100% 显示(内容不裁切), 宽度超出才裁左右,
     // 不足则居中留深色边 —— 避免竖屏视频上下被裁掉一截。
     const bool framePortrait = frame.height > frame.width;
-    // 横屏帧:2 分屏下节流检测左右黑边(竖屏内容), 检测到则铺满前先裁黑边
+    // 横屏帧:2 分屏下先判断帧左右边缘是否有足够宽的纯黑边(竖屏内容特征)。
+    // 有黑边 → 取帧中央固定 9:16 区域(不做内容边界采样, 深色内容不会被误裁);
+    // 无黑边(真横屏内容) → 整帧原样显示, 不做任何裁切。
     QRect barRect(0, 0, frame.width, frame.height);
-    if (m_fillMode && !framePortrait) {
-        const qint64 now = QDateTime::currentMSecsSinceEpoch();
-        if (now - m_lastBarCheck > 300 || m_lastBarRect.width() != frame.width
-            || m_lastBarRect.height() != frame.height) {
-            m_lastBarCheck = now;
-            m_lastBarRect = detectSideBars(img);
-            if (m_lastBarRect.width() != frame.width)
-                qInfo() << "[bar] 2 分屏检测到竖屏内容区"
-                        << m_lastBarRect.width() << "x" << m_lastBarRect.height()
-                        << "in" << frame.width << "x" << frame.height;
-        }
-        barRect = m_lastBarRect;
+    if (m_fillMode && !framePortrait && hasSideBars(img)) {
+        const int ch = frame.height;
+        const int cw = qMin(ch * 9 / 16, frame.width);
+        barRect = QRect((frame.width - cw) / 2, 0, cw, ch);
     }
-    // 内容为竖屏(帧本身竖屏, 或横屏帧内裁出的内容区竖屏)才铺满
+    // 内容为竖屏(帧本身竖屏, 或横屏帧内取出的内容区竖屏)才铺满
     const bool contentPortrait = framePortrait || barRect.width() < barRect.height();
     const bool fill = m_fillMode && contentPortrait;
 
@@ -715,8 +727,8 @@ void SessionView::renderFrame()
     QRectF src(barRect), dst;
     if (fill) {
         // 高度优先铺满:高度 100%(上下不裁), 宽度超出才裁左右, 不足居中留边
-        // 2026-08-15:裁切仅左右各留 10px 黑边, 上下贴满格子边缘。
-        const double inset = 10.0;
+        // 2026-08-16:裁切仅左右各留 30px 黑边, 上下贴满格子边缘。
+        const double inset = 30.0;
         const double availW = target.width() - inset * 2;
         const double availH = target.height();
         const double s = availH / src.height();
@@ -978,7 +990,7 @@ void SessionView::updateInfoBadge()
         m_infoBadge->hide();
         return;
     }
-    // 定位到本视图左上角(全局坐标), 悬浮在视频之上
+    // 定位到本视图左上角(全局坐标, 主窗口跨屏移动时由 moveEvent 联动重定位)
     m_infoBadge->move(mapToGlobal(QPoint(12, 12)));
     m_infoBadge->show();
     m_infoBadge->raise();
@@ -1018,20 +1030,44 @@ void SessionView::toggleMute()
 {
     if (!m_sdkSession)
         return;
-    const uint64_t pid = mirror_get_process_id(m_sdkSession);
-    if (!pid) {
-        setStatus(QStringLiteral("后端未就绪"));
-        return;
-    }
     m_muted = !m_muted;
-    if (!mirrorui::setProcessAudioMute(pid, m_muted)) {
-        m_muted = !m_muted;   // 未找到音频会话, 回滚
+    if (!applyMute(m_muted)) {
+        m_muted = !m_muted;   // 静音控制失败, 回滚
         setStatus(QStringLiteral("静音控制失败"));
         return;
     }
     if (m_muteBtn)
         m_muteBtn->setText(m_muted ? QStringLiteral("🔇") : QStringLiteral("🔊"));
     setStatus(m_muted ? QStringLiteral("已静音") : QStringLiteral("已取消静音"));
+}
+
+bool SessionView::applyMute(bool mute)
+{
+    if (!m_sdkSession)
+        return false;
+    // Miracast: 组共享同一接收进程, 必须按连接静音(SETMUTE), 不能用进程级 WASAPI
+    // (否则整组(含焦点路)都被静音)。
+    if (m_backend == MIRROR_BACKEND_MIRACAST) {
+        mirror_set_session_mute(m_sdkSession, mute);
+        return true;
+    }
+    // AirPlay/MICE: 每实例独立 uxplay 进程 → WASAPI 按 PID 精确静音
+    const uint64_t pid = mirror_get_process_id(m_sdkSession);
+    if (!pid) {
+        setStatus(QStringLiteral("后端未就绪"));
+        return false;
+    }
+    return mirrorui::setProcessAudioMute(pid, mute);
+}
+
+void SessionView::setMuted(bool mute)
+{
+    if (!m_sdkSession)
+        return;
+    m_muted = mute;
+    applyMute(mute);
+    if (m_muteBtn)
+        m_muteBtn->setText(mute ? QStringLiteral("🔇") : QStringLiteral("🔊"));
 }
 
 void SessionView::toggleFullscreen()
@@ -1048,8 +1084,30 @@ void SessionView::setFullscreenActive(bool active)
 void SessionView::setClientInfo(const QString &name, const QString &model)
 {
     Q_UNUSED(model)   // 只显示设备名称
-    if (!name.isEmpty() && m_devLabel)
-        m_devLabel->setText(name);
+    if (!name.isEmpty()) {
+        // 真实设备名(如 "Honor 10")替换占位名(Miracast-N):
+        // 信息栏标签 + m_deviceName(控制面板列表 sourceItems 取 deviceName())
+        m_deviceName = name;
+        if (m_devLabel)
+            m_devLabel->setText(name);
+    }
+    if (!name.isEmpty())
+        emit clientNameChanged(name);
+}
+
+// 设备名就绪(服务端经帧通道上报 MCCTRL1NAME) → 排队主线程更新信息栏
+void SessionView::onClientInfoCallback(mirror_session_t *session, const char *client_name,
+                                       const char *client_model, void *userdata)
+{
+    Q_UNUSED(session)
+    auto *self = static_cast<SessionView *>(userdata);
+    if (!self)
+        return;
+    const QString name = QString::fromUtf8(client_name ? client_name : "");
+    const QString model = QString::fromUtf8(client_model ? client_model : "");
+    QMetaObject::invokeMethod(self, [self, name, model]() {
+        self->setClientInfo(name, model);
+    }, Qt::QueuedConnection);
 }
 
 void SessionView::setStatus(const QString &s)

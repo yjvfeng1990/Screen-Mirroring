@@ -34,7 +34,6 @@ namespace MiracastReceiverService
 
         /// 本路帧端口(Program 空闲端口分配用, 连接断开后该端口可被复用)
         public int Port => _port;
-
         // 单槽最新帧(发送慢于回调时实时丢弃旧帧,避免延迟累积)
         // 重要:VideoFrame 的 D3D surface 不能跨帧复用(CopyFrameToVideoSurface 要求全新 surface),
         // 所以每帧新建。释放(Dispose)一律在 SendLoop 线程执行:
@@ -47,6 +46,7 @@ namespace MiracastReceiverService
         // TCP
         private TcpClient _client;
         private NetworkStream _stream;
+        private readonly object _writeLock = new();   // 保护控制消息与帧头并发写
 
         // 统计
         private long _cbCount;
@@ -97,6 +97,14 @@ namespace MiracastReceiverService
         // Program 按连接数的 ScaleEdge。-1 = 未设置(用服务端默认)。
         public volatile int EdgeOverride = -1;
 
+        // 本路对应的 MediaPlayer(Program 在连接创建后赋值, 断开时清空)。
+        // 宿主 SETMUTE 命令按"连接"静音: Miracast 组共享同一接收进程,
+        // 用 WASAPI 按进程静音会把整组(含焦点路)都静音, 必须走 MediaPlayer.Volume。
+        public MediaPlayer MediaPlayerRef { get; set; }
+
+        // 宿主 SETDISC 命令 → 请求断开该连接(由 Program 挂接 MiracastReceiverConnection)。
+        public Action RequestDisconnect;
+
         public FrameServerSocket(int port, string name)
         {
             _port = port;
@@ -137,6 +145,25 @@ namespace MiracastReceiverService
         // 宿主 FrameClient 在帧 TCP 通道上发文本行 "SETFPS n"(n>0 强制帧率, 0 恢复默认)。
         // 帧通道方向只有服务端→宿主写帧头, 宿主→服务端仅此控制消息, 无数据冲突。
 
+        /// 向宿主发控制消息(带 MCCTRL1 前缀以区分帧头协议)。仅在连接建立初期
+        /// (帧数据开始前)调用, 与发送循环无竞争; 写锁防止与帧头字节交错。
+        public void SendControl(string message)
+        {
+            try
+            {
+                if (_stream != null && _client != null && _client.Connected)
+                {
+                    byte[] bytes = System.Text.Encoding.ASCII.GetBytes("MCCTRL1" + message + "\n");
+                    lock (_writeLock)
+                    {
+                        _stream.Write(bytes, 0, bytes.Length);
+                        _stream.Flush();
+                    }
+                }
+            }
+            catch (Exception ex) { Program.Log("SendCtrl", ex); }
+        }
+
         private async Task ControlLoop()
         {
             try
@@ -169,6 +196,31 @@ namespace MiracastReceiverService
                                     EdgeOverride = edge;
                                     Program.Log("Ctrl", new Exception($"SETEDGE {edge}"));
                                 }
+                            }
+                            else if (line.StartsWith("SETMUTE ", StringComparison.Ordinal))
+                            {
+                                // 宿主全屏放大: 焦点路 SETMUTE 0(取消静音), 其余路 SETMUTE 1(静音)。
+                                // 按连接静音(MediaPlayer.Volume), 不能用 WASAPI 进程级(组内会误伤)。
+                                if (int.TryParse(line.Substring(8), out int m) && MediaPlayerRef != null)
+                                {
+                                    try
+                                    {
+                                        MediaPlayerRef.Volume = (m != 0) ? 0.0 : 1.0;
+                                        Program.Log("Ctrl", new Exception($"SETMUTE {m} vol={MediaPlayerRef.Volume}"));
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Program.Log("Ctrl", ex);
+                                    }
+                                }
+                            }
+                            else if (line.StartsWith("SETDISC", StringComparison.Ordinal))
+                            {
+                                // 宿主移除该投屏源: 仅断开本连接(不动其它连接)。
+                                // 由 Program 挂接的 RequestDisconnect → conn.Disconnect() →
+                                // OnConnectionDisconnected 清理本路状态, 服务进程与其余路保留。
+                                try { RequestDisconnect?.Invoke(); }
+                                catch (Exception ex) { Program.Log("Ctrl", ex); }
                             }
                         }
                         else if (buffer.Count < 64)
@@ -311,7 +363,19 @@ namespace MiracastReceiverService
                     catch (Exception ex)
                     {
                         Program.Log("SendFrame", ex);
-                        Environment.Exit(0);  // 网络断开 → 退出(宿主重启后会重新拉起)
+                        // 该路帧通道断开: 若仍有其它存活连接(多路共享进程), 只结束本路
+                        // 发送循环, 不能把整组服务进程带崩 —— 2026-08-15 实测根因:
+                        // 宿主移除单路时只关本路通道, 旧代码 Environment.Exit 会杀整个
+                        // Miracast 服务进程, 其余在投连接全部断开。仅当这是最后一路
+                        // (宿主离开/进程被外部杀死)时才退出进程。
+                        bool anyOther;
+                        lock (Program.ConnectionsLock)
+                        {
+                            anyOther = Program.ActiveConnectionCount > 1;
+                        }
+                        if (anyOther)
+                            return;
+                        Environment.Exit(0);  // 最后一路断开 → 宿主已离开 → 退出
                     }
                     finally { vf?.Dispose(); }
                 }
@@ -319,7 +383,7 @@ namespace MiracastReceiverService
             catch (Exception ex)
             {
                 Program.Log("SendLoop", ex);
-                Environment.Exit(1);
+                return;   // 单路循环异常只结束本路, 不杀共享服务进程
             }
         }
 

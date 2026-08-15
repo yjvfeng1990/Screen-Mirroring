@@ -37,6 +37,8 @@ signals:
     void sessionWindowReady(const QString &id, qulonglong handle);
     void sessionFrameReady(const QString &id);
     void sessionLog(const QString &id, const QString &message);
+    /// 投屏设备真实名称(服务端经帧通道上报)
+    void sessionClientInfo(const QString &id, const QString &name, const QString &model);
 
 private slots:
     void onSessionDestroyed(QObject *obj);

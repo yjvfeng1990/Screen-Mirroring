@@ -20,12 +20,13 @@
 ControlPanel::ControlPanel(QWidget *parent)
     : QWidget(parent)
 {
-    // 无边框 + 置顶 + 工具窗口(不出现在任务栏), 不抢焦点(侧边栏交互)
-    setWindowFlags(Qt::FramelessWindowHint
-                   | Qt::WindowStaysOnTopHint
-                   | Qt::Tool);
+    // 独立顶层 Tool 窗(带 parent 跟随主窗口), 置顶防被 AirPlay 嵌入的 D3D11
+    // 渲染窗口(uxplay swap chain)盖住 —— 子控件 raise() 压不住翻转模型渲染
+    // 窗口, 与信息栏 infoBadge 同款方案(Qt::Tool + WindowStaysOnTopHint)。
+    // 收起 = hide() 完全隐藏, 展开 = show()+raise() 覆盖在主窗口右侧, 跟随
+    // 主窗口最小化/移动(顶层子窗自动跟随 + Move 事件兜底重定位)。
+    setWindowFlags(Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
     setAttribute(Qt::WA_TranslucentBackground, true);  // 外层透明,圆角由 m_rootFrame 实现
-    setAttribute(Qt::WA_ShowWithoutActivating, true);
     setMinimumSize(300, 400);
     resize(320, 600);
 
@@ -38,29 +39,20 @@ ControlPanel::ControlPanel(QWidget *parent)
     shadow->setColor(QColor(0, 0, 0, 160));
     m_rootFrame->setGraphicsEffect(shadow);
 
-    // ---- 侧边吸附(参考 TopDesk) ----
+    // ---- 内嵌面板 ----
     m_panelWidth = width();
 
-    // 触发条: 屏幕右边缘 8x44 的竖条, 悬停/点击展开
-    m_triggerButton = new QWidget(nullptr);
-    m_triggerButton->setWindowFlags(Qt::FramelessWindowHint
-                                    | Qt::WindowStaysOnTopHint
-                                    | Qt::Tool);
-    m_triggerButton->setAttribute(Qt::WA_ShowWithoutActivating, true);
-    m_triggerButton->setFixedSize(m_collapsedWidth, 44);
-    m_triggerButton->setStyleSheet(
-        "background-color:#20242E; border-top-left-radius:6px;"
-        "border-bottom-left-radius:6px;");
-    m_triggerButton->setCursor(Qt::PointingHandCursor);
-    m_triggerButton->installEventFilter(this);
-
-    // 鼠标离开面板 300ms 后收起
+    // 鼠标离开面板 300ms 后收起(面板内嵌主窗口, 移出面板即视为"点空白收回")
     m_hideTimer = new QTimer(this);
     m_hideTimer->setInterval(300);
     m_hideTimer->setSingleShot(true);
     connect(m_hideTimer, &QTimer::timeout, this, [this]() {
-        if (m_dockedExpanded && !geometry().contains(QCursor::pos()))
-            collapse();
+        if (!m_dockedExpanded)
+            return;
+        const QPoint pos = QCursor::pos();
+        if (rect().contains(mapFromGlobal(pos)))
+            return;
+        collapse();
     });
 
     // 缩略图刷新节拍(仅展开时工作)
@@ -72,10 +64,13 @@ ControlPanel::ControlPanel(QWidget *parent)
     });
     m_thumbTimer->start();
 
-    // 初始: 展开吸附在屏幕右边缘
-    m_dockedExpanded = true;
-    updateDockGeometry();
-    updateTriggerPosition();
+    // 初始: 收起(面板隐藏), 由触发条/按钮展开
+    m_dockedExpanded = false;
+    hide();
+
+    // 内嵌面板: 监听父窗口 resize 跟随重定位; 点击父窗口空白处收回面板
+    if (parentWidget())
+        parentWidget()->installEventFilter(this);
 }
 
 ControlPanel::~ControlPanel() = default;
@@ -130,7 +125,7 @@ void ControlPanel::buildTitleBar()
     ico->setStyleSheet("background-color:transparent; font-size:14px;");
     tl->addWidget(ico);
 
-    m_titleLabel = new QLabel(QStringLiteral("播放器窗口"));
+    m_titleLabel = new QLabel(QStringLiteral("控制面板"));
     m_titleLabel->setStyleSheet(
         "color:#C2C9D6; font-size:13px; font-weight:600;"
         "background-color:transparent;");
@@ -223,6 +218,19 @@ void ControlPanel::setSources(const QList<SourceInfo> &sources)
             "background-color:transparent;");
         name->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
         hl->addWidget(name, 1);
+
+        // 移除按钮(断开该投屏设备)
+        auto *btnRemove = new QToolButton(card);
+        btnRemove->setObjectName("srcItemRemoveBtn");
+        btnRemove->setText(QStringLiteral("✕"));
+        btnRemove->setToolTip(QStringLiteral("移除该投屏设备"));
+        btnRemove->setFixedSize(22, 22);
+        btnRemove->setCursor(Qt::PointingHandCursor);
+        connect(btnRemove, &QToolButton::clicked, this, [this, id = s.sessionId]() {
+            emit removeRequested(id);
+        });
+        hl->addWidget(btnRemove, 0, Qt::AlignVCenter);
+
         m_listLayout->insertWidget(m_listLayout->count() - 2, card);
 
         m_thumbLabels.insert(s.sessionId, thumb);
@@ -277,13 +285,10 @@ void ControlPanel::updateSelection()
 
 void ControlPanel::setPanelVisible(bool show)
 {
-    if (show) {
-        if (isHidden())
-            QWidget::show();
+    if (show)
         expand();
-    } else {
+    else
         collapse();
-    }
 }
 
 bool ControlPanel::isPanelVisible() const
@@ -291,43 +296,48 @@ bool ControlPanel::isPanelVisible() const
     return isVisible() && m_dockedExpanded;
 }
 
-// ---- 侧边吸附(参考 TopDesk) ----
+void ControlPanel::setHostMinimized(bool minimized)
+{
+    if (minimized) {
+        // 主窗口最小化: 面板随主窗口一起隐藏
+        hide();
+    } else if (m_dockedExpanded) {
+        // 主窗口还原: 恢复展开显示
+        expand();
+    }
+}
+
+// ---- 内嵌面板 ----
 
 void ControlPanel::expand()
 {
-    if (m_dockedExpanded)
-        return;
     m_dockedExpanded = true;
     updateDockGeometry();
-    m_triggerButton->hide();
+    if (isHidden())
+        QWidget::show();
+    raise();   // 覆盖在主窗口内容之上
 }
 
 void ControlPanel::collapse()
 {
-    if (!m_dockedExpanded)
-        return;
     m_dockedExpanded = false;
-    updateDockGeometry();
-    updateTriggerPosition();
-    m_triggerButton->show();
+    hide();
 }
 
 void ControlPanel::updateDockGeometry()
 {
-    const QRect screen = QApplication::primaryScreen()->availableGeometry();
-    const int x = screen.right() - m_panelWidth
-                + (m_dockedExpanded ? 0 : m_collapsedWidth);
-    const int y = screen.center().y() - height() / 2;
-    setGeometry(x, y, m_panelWidth, height());
-}
-
-void ControlPanel::updateTriggerPosition()
-{
-    if (!m_triggerButton)
+    QWidget *host = parentWidget();
+    if (!host) {
+        hide();
         return;
-    const QRect screen = QApplication::primaryScreen()->availableGeometry();
-    const int y = screen.center().y() - m_triggerButton->height() / 2;
-    m_triggerButton->move(screen.right() - m_collapsedWidth + 1, y);
+    }
+    const int h = qMin(600, host->height() - 24);
+    const int y = (host->height() - h) / 2;
+    // 顶层 Tool 窗:位置为屏幕全局坐标(子控件时代是主窗口相对坐标)
+    // 展开: 面板覆盖在主窗口右侧内部(留 4px 呼吸空间)
+    const QPoint topLeft = host->mapToGlobal(
+        QPoint(host->width() - m_panelWidth - 4, y));
+    setGeometry(topLeft.x(), topLeft.y(), m_panelWidth, h);
 }
 
 void ControlPanel::enterEvent(QEnterEvent *event)
@@ -347,12 +357,19 @@ void ControlPanel::leaveEvent(QEvent *event)
 
 bool ControlPanel::eventFilter(QObject *obj, QEvent *event)
 {
-    // 触发条: 悬停或点击 → 展开
-    if (obj == m_triggerButton) {
-        if (event->type() == QEvent::Enter || event->type() == QEvent::MouseButtonPress) {
-            if (!m_dockedExpanded)
-                expand();
-            return true;
+    // 父窗口(主窗口)resize/移动 → 面板跟随重定位
+    if (obj == parentWidget()) {
+        if ((event->type() == QEvent::Resize || event->type() == QEvent::Move)
+            && m_dockedExpanded) {
+            updateDockGeometry();
+            return false;
+        }
+        // 点击父窗口空白处(不在面板内) → 收回面板
+        if (m_dockedExpanded && event->type() == QEvent::MouseButtonPress) {
+            auto *me = static_cast<QMouseEvent *>(event);
+            // 顶层窗:geometry() 是全局坐标, 需用全局点击位置判断
+            if (!geometry().contains(me->globalPosition().toPoint()))
+                collapse();
         }
         return false;
     }

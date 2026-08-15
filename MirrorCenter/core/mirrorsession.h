@@ -6,6 +6,8 @@
 #include <QPointer>
 #include <QProcess>
 #include <QImage>
+#include <QTimer>
+#include <QElapsedTimer>
 
 class QProcess;
 
@@ -72,6 +74,12 @@ public:
     /// 混合路数分档: 向接收服务设置该路读回最大边(0 不缩放, >0 上限)
     void setFrameTargetEdge(int edge);
 
+    /// 全屏放大场景: 本路静音/取消静音(Miracast 组按连接走 SETMUTE)。
+    void setTargetMute(bool mute);
+
+    /// 移除投屏源: 请求断开本路连接(Miracast 按连接走 SETDISC, 服务进程保留)。
+    void setTargetDisconnect();
+
     void start();
     void stop();
 
@@ -80,6 +88,8 @@ signals:
     void windowReady(const QString &id, qulonglong handle);
     void logMessage(const QString &id, const QString &message);
     void frameReady(const QString &id);
+    /// 投屏设备真实名称(服务端经帧通道上报, 如 "Honor 10")
+    void clientInfoChanged(const QString &id, const QString &name, const QString &model);
 
 private slots:
     void onReadyReadStdout();
@@ -88,6 +98,7 @@ private slots:
     void onErrorOccurred(QProcess::ProcessError error);
     void onFrameClientReady();
     void onFrameClientDisconnected();
+    void onFrameIdleTimeout();
 
 private:
     void setState(SessionState s);
@@ -108,6 +119,11 @@ private:
     bool m_frameMode = false;
     QString m_frameAddress;
     quint16 m_framePort = 0;
+
+    // 帧空闲检测:投屏源断开但帧通道未及时关闭时(服务端 Disconnected 事件
+    // 可能延迟/不触发), 连续 3s 无帧 → 视设备已断开 → 清画面回等待。
+    QTimer m_frameIdleTimer;
+    QElapsedTimer m_frameTimer;
 };
 
 } // namespace mirror

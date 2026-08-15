@@ -85,11 +85,20 @@ typedef void (*mirror_log_callback)(mirror_session_t *session,
 typedef void (*mirror_frame_callback)(mirror_session_t *session,
                                       void *userdata);
 
+/* 来源手机名称/型号就绪(服务端经帧通道上报, 如 Miracast "Honor 10")。
+ * 字符串仅在本次回调内有效。 */
+typedef void (*mirror_client_info_callback)(mirror_session_t *session,
+                                            const char *client_name,
+                                            const char *client_model,
+                                            void *userdata);
+
 typedef struct mirror_callbacks {
     mirror_state_callback  on_state;
     mirror_window_callback on_window;
     mirror_log_callback    on_log;
     mirror_frame_callback  on_frame;
+    /* 来源手机信息(名称/型号)就绪 */
+    mirror_client_info_callback on_client_info;
 } mirror_callbacks_t;
 
 /* ---- 网关(单广播名 + 多静默实例调度) ---- */
@@ -281,6 +290,21 @@ MIRROR_API mirror_result_t mirror_set_frame_fps(mirror_session_t *session, int f
  * 宿主按总活跃路数(含 AirPlay)计算并推送, 覆盖服务端按自身连接数的默认分档。
  */
 MIRROR_API mirror_result_t mirror_set_frame_edge(mirror_session_t *session, int edge);
+
+/*
+ * 设置会话静音/取消静音:
+ * - Miracast(有 FrameClient): 经 SETMUTE 按"连接"静音, 组内各路独立, 不误伤其它路。
+ * - AirPlay/MICE: 无 FrameClient, 由宿主按进程 PID 静音(uxplay 每实例独立进程),
+ *   本接口仅记录意图; 宿主全屏联动时用 mirror_get_process_id + WASAPI。
+ */
+MIRROR_API mirror_result_t mirror_set_session_mute(mirror_session_t *session, bool mute);
+
+/*
+ * 断开该会话的连接(Miracast 帧模式): 经帧通道发 SETDISC, 服务端
+ * MiracastReceiverConnection.Disconnect 断开本路 —— 仅本路断开, 服务进程与
+ * 其余路全部保留(移除单个投屏源专用)。AirPlay/MICE 无 FrameClient, 返回 OK 无操作。
+ */
+MIRROR_API mirror_result_t mirror_set_session_disconnect(mirror_session_t *session);
 
 /* 获取错误说明(线程本地缓冲,仅供调试)。 */
 MIRROR_API const char *mirror_last_error(void);

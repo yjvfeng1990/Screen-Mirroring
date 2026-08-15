@@ -180,17 +180,61 @@ void FrameClient::setTargetEdge(int edge)
     qInfo() << "[frame] send SETEDGE" << edge << "(port" << m_port << ")";
 }
 
+void FrameClient::setTargetMute(bool mute)
+{
+    if (!m_socket || !m_socket->isValid())
+        return;
+    QByteArray cmd = "SETMUTE " + QByteArray::number(mute ? 1 : 0) + "\n";
+    m_socket->write(cmd);
+    m_socket->flush();
+    qInfo() << "[frame] send SETMUTE" << (mute ? 1 : 0) << "(port" << m_port << ")";
+}
+
+void FrameClient::setTargetDisconnect()
+{
+    if (!m_socket || !m_socket->isValid())
+        return;
+    QByteArray cmd = "SETDISC\n";
+    m_socket->write(cmd);
+    m_socket->flush();
+    qInfo() << "[frame] send SETDISC (port" << m_port << ")";
+}
+
 void FrameClient::onReadyRead()
 {
     if (!m_socket)
         return;
     m_buffer.append(m_socket->readAll());
+
+    // 服务端→宿主控制消息(MCCTRL1 前缀文本行):仅在连接建立初期发送,
+    // 此时无帧头数据, 与帧解析互斥, 不会混淆。
+    while (m_buffer.size() >= 7 && m_buffer.startsWith("MCCTRL1")) {
+        const int nl = m_buffer.indexOf('\n');
+        if (nl < 0)
+            return;   // 行未完整, 等更多数据
+        const QByteArray line = m_buffer.left(nl);
+        m_buffer.remove(0, nl + 1);
+        m_bufferOffset = 0;
+        handleControlMessage(line);
+    }
+
     while (tryParseFrame())
         ;
     // 压缩消费掉的前缀:仅在偏移过半时做一次 memmove, 避免每帧 8MB 移动
     if (m_bufferOffset > 0 && m_bufferOffset >= m_buffer.size() / 2) {
         m_buffer.remove(0, m_bufferOffset);
         m_bufferOffset = 0;
+    }
+}
+
+// 服务端控制消息: "MCCTRL1NAME:<设备名>"
+void FrameClient::handleControlMessage(const QByteArray &line)
+{
+    const QByteArray body = line.mid(7);   // 去掉 MCCTRL1 前缀
+    if (body.startsWith("NAME:")) {
+        const QString name = QString::fromUtf8(body.mid(5));
+        qInfo() << "[frame] device name received:" << name;
+        emit deviceNameReceived(name);
     }
 }
 

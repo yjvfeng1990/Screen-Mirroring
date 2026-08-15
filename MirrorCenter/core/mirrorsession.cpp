@@ -101,10 +101,31 @@ void MirrorSession::setFrameTargetEdge(int edge)
         m_frameClient->setTargetEdge(edge);
 }
 
+void MirrorSession::setTargetMute(bool mute)
+{
+    if (m_frameClient)
+        m_frameClient->setTargetMute(mute);
+}
+
+void MirrorSession::setTargetDisconnect()
+{
+    if (m_frameClient)
+        m_frameClient->setTargetDisconnect();
+}
+
 void MirrorSession::start()
 {
     if (m_process)
         return;
+
+    // 帧模式:启动帧空闲检测(1s 粒度)。投屏源断开时服务端 Disconnected 事件可能
+    // 延迟/不触发(重连后第二次断开实测), 帧通道不会及时关闭, 依赖此超时清画面。
+    if (m_frameMode) {
+        m_frameIdleTimer.setInterval(1000);
+        connect(&m_frameIdleTimer, &QTimer::timeout,
+                this, &MirrorSession::onFrameIdleTimeout);
+        m_frameIdleTimer.start();
+    }
 
     // Windows Miracast:接收由桌面辅助进程(MiracastReceiverService.exe)承担,
     // 无窗口、无 UWP 挂起限制。子进程作为普通 QProcess 启动(见下方流程)。
@@ -116,7 +137,21 @@ void MirrorSession::start()
             connect(m_frameClient, &FrameClient::disconnected,
                     this, &MirrorSession::onFrameClientDisconnected);
             connect(m_frameClient, &FrameClient::frameReady,
-                    this, [this]() { emit frameReady(m_id); });
+                    this, [this]() {
+                        // 首帧到达 = 投屏设备真正出画(离开"等待"态)。
+                        // 状态必须由首帧驱动而非"监听就绪"(connected): 若监听建立
+                        // 即置 WindowReady, 从会话随后会被 setState(Starting) 覆盖,
+                        // 出画期间状态停留 Starting → 设备断开时 setState(Starting)
+                        // 因状态相同被跳过 → UI 收不到 STARTING → 画面卡最后一帧。
+                        if (m_state != SessionState::WindowReady)
+                            setState(SessionState::WindowReady);
+                        m_frameTimer.restart();   // 帧活跃时间(空闲超时检测基准)
+                        emit frameReady(m_id);
+                    });
+            connect(m_frameClient, &FrameClient::deviceNameReceived, this,
+                    [this](const QString &name) {
+                        emit clientInfoChanged(m_id, name, QString());
+                    });
             // UWP 出站连接本机监听端口(AppContainer 入站隔离,方向必须反转)
             m_frameClient->startListening(m_framePort);
         }
@@ -177,13 +212,25 @@ void MirrorSession::start()
         connect(m_frameClient, &FrameClient::connected, this, &MirrorSession::onFrameClientReady);
         connect(m_frameClient, &FrameClient::disconnected, this, &MirrorSession::onFrameClientDisconnected);
         connect(m_frameClient, &FrameClient::frameReady,
-                this, [this]() { emit frameReady(m_id); });
+                this, [this]() {
+                    // 首帧到达才离开"等待"态(见 external 分支注释: 状态须由首帧驱动,
+                    // 否则设备断开时 setState(Starting) 被状态去重跳过 → 画面卡住)
+                    if (m_state != SessionState::WindowReady)
+                        setState(SessionState::WindowReady);
+                    m_frameTimer.restart();   // 帧活跃时间(空闲超时检测基准)
+                    emit frameReady(m_id);
+                });
+        connect(m_frameClient, &FrameClient::deviceNameReceived, this,
+                [this](const QString &name) {
+                    emit clientInfoChanged(m_id, name, QString());
+                });
         m_frameClient->startListening(m_framePort);
     }
 }
 
 void MirrorSession::stop()
 {
+    m_frameIdleTimer.stop();
     if (m_frameClient) {
         m_frameClient->stopListening();
         m_frameClient->deleteLater();
@@ -255,10 +302,27 @@ void MirrorSession::onErrorOccurred(QProcess::ProcessError error)
     }
 }
 
+void MirrorSession::onFrameIdleTimeout()
+{
+    // 仅出画中(WindowReady)才检测:等待态无帧属正常, 不误判
+    if (m_state != SessionState::WindowReady)
+        return;
+    if (!m_frameTimer.isValid() || m_frameTimer.elapsed() <= 3000)
+        return;
+    emit logMessage(m_id, QStringLiteral("frame idle 3s, treat as source disconnected"));
+    // 帧通道未及时关闭(服务端 Disconnected 事件延迟)时主动回等待态 → UI 清画面。
+    // 若随后服务端才关通道, onFrameClientDisconnected 会重复 setState(Starting),
+    // 状态相同被去重, 无副作用; 若设备其实重连, 新帧到达后重新出画。
+    setState(SessionState::Starting);
+}
+
 void MirrorSession::onFrameClientReady()
 {
     emit logMessage(m_id, QStringLiteral("frame link established"));
-    setState(SessionState::WindowReady);
+    // 注意:不再在此置 WindowReady —— 监听就绪(服务端连入)不等于投屏设备出画。
+    // 状态由首帧(frameReady lambda)驱动, 否则从会话在"等待设备"阶段即被置为
+    // WindowReady, 设备断开时 setState(Starting) 因状态相同被跳过 → UI 收不到
+    // STARTING → 画面卡最后一帧(2026-08-16 实测"投屏源主动断开画面不消失")。
 }
 
 void MirrorSession::onFrameClientDisconnected()

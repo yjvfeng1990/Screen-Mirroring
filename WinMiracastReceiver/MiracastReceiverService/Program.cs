@@ -36,7 +36,14 @@ namespace MiracastReceiverService
 
         // 每路连接状态:连接 → (MediaPlayer + FrameServerSocket)
         private static readonly Dictionary<MiracastReceiverConnection, ConnectionState> _connections = new();
-        private static readonly object _connectionsLock = new();   // 保护并发连接分配(多设备同时连入)
+        internal static readonly object ConnectionsLock = new();   // 保护并发连接分配(多设备同时连入)
+
+        // FrameServerSocket 发送循环用: 通道断开时判断是否还有其它存活连接。
+        // >1 只结束本路(多路共享进程, 移除单路不能杀整组); ==1 视为宿主离开退出进程。
+        internal static int ActiveConnectionCount
+        {
+            get { lock (ConnectionsLock) return _connections.Count; }
+        }
 
         private sealed class ConnectionState : IDisposable
         {
@@ -49,22 +56,37 @@ namespace MiracastReceiverService
             public long FrameCount;
             public int LogT;
             public long LogN;
+            // 最近收到帧的时刻(Environment.TickCount, int 毫秒)。设备断开但
+            // session.Disconnected 事件未及时触发时, 定时器据此判定"无帧超时"
+            // 主动清理, 保证宿主帧通道及时关闭。
+            public volatile int LastFrameTick;
 
             public void Dispose()
             {
-                if (MediaPlayer != null)
-                {
-                    MediaPlayer.IsVideoFrameServerEnabled = false;
-                    MediaPlayer.Dispose();
-                    MediaPlayer = null;
-                }
-                FrameServer?.Dispose();
+                // 全程 try-catch: 回调线程(ConnectionDisconnected/MediaFailed 重试)上
+                // 任何一步抛未捕获异常都会直接杀死进程, 且崩溃瞬间来不及写日志。
+                // 实测 2026-08-15: 设备断开时进程在正常收帧中"戛然而止"无任何异常堆栈。
+                try { if (MediaPlayer != null) { MediaPlayer.IsVideoFrameServerEnabled = false; } }
+                catch (Exception ex) { Program.Log("Dispose", ex); }
+                try { MediaPlayer?.Dispose(); } catch (Exception ex) { Program.Log("Dispose", ex); }
+                MediaPlayer = null;
+                try { FrameServer?.Dispose(); } catch (Exception ex) { Program.Log("Dispose", ex); }
                 FrameServer = null;
             }
         }
 
         private static void Main(string[] args)
         {
+            // 全局兜底: 任何线程的未捕获异常(含 Miracast 回调线程)都先留日志再退出,
+            // 避免"进程悄然消失、日志停在正常收帧处"无法定位。
+            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+                Log("Fatal", e.ExceptionObject as Exception ?? new Exception("Unhandled"));
+            TaskScheduler.UnobservedTaskException += (s, e) =>
+            {
+                Log("TaskFault", e.Exception);
+                e.SetObserved();
+            };
+
             ParseArgs(args);
             Log("Info", new Exception($"Service starting ports=[{string.Join(",", _ports)}] max={_maxConnections} name={_sessionName}"));
             try
@@ -161,6 +183,11 @@ namespace MiracastReceiverService
                 Log("Info", new Exception("StartAsync..."));
                 var start = await _session.StartAsync();
                 Log("Info", new Exception($"Session.Start={start.Status}"));
+
+                // 无帧超时检测(1s 粒度): 设备断开但 session.Disconnected 事件未及时
+                // 触发时(重连后第二次断开实测会延迟), 3s 无帧 → 主动清理该连接,
+                // 关闭帧通道 → 宿主 FrameClient 立即断链清画面, 无需等系统超时。
+                new System.Threading.Timer(CheckIdleConnections, null, 1000, 1000);
             }
             catch (Exception ex)
             {
@@ -183,7 +210,7 @@ namespace MiracastReceiverService
                 var state = new ConnectionState();
 
                 // 分配路索引/端口:并发保护 + 提前登记(防同连接重复事件)
-                lock (_connectionsLock)
+                lock (ConnectionsLock)
                 {
                     if (_connections.ContainsKey(conn))
                     {
@@ -220,6 +247,72 @@ namespace MiracastReceiverService
                 await state.FrameServer.StartAsync();
                 Log("Info", new Exception($"Connection#{state.Index} FrameServer connected port {state.Port}"));
 
+                // 设备名 → 宿主(信息栏/控制列表显示真实设备名, 如 "Honor 10").
+                // 连接建立初期发送, 帧数据开始前, 与帧头无竞争。
+                try { state.FrameServer.SendControl("NAME:" + (conn.Transmitter.Name ?? "")); }
+                catch (Exception ex) { Log("Name", ex); }
+
+                // 宿主移除该投屏源(SETDISC): 主动断开本连接。
+                // 注意: 文档明确"应用自己 Disconnect 时 session.Disconnected 事件不会触发",
+                // 因此断开后必须手动清理本路状态(不能等 OnConnectionDisconnected)。
+                // 实测 2026-08-16: 仅 Disconnect 不生效(连接仍收帧), 需组合
+                // 停止 MediaPlayer + Disconnect + Close(IDisposable) 兜底。
+                state.FrameServer.RequestDisconnect = () =>
+                {
+                    try
+                    {
+                        Log("Ctrl", new Exception($"RequestDisconnect conn#{state.Index} begin"));
+
+                        // 1) 停止媒体消费,释放帧链路
+                        try
+                        {
+                            var mp = state.MediaPlayer;
+                            if (mp != null)
+                            {
+                                mp.IsVideoFrameServerEnabled = false;
+                                mp.Pause();
+                                mp.Dispose();
+                            }
+                        }
+                        catch (Exception ex) { Log("Disconnect", ex); }
+                        state.MediaPlayer = null;
+                        state.FrameServer.MediaPlayerRef = null;
+
+                        // 2) 通知设备断开
+                        try
+                        {
+                            conn.Disconnect(
+                                Windows.Media.Miracast.MiracastReceiverDisconnectReason.DisconnectedByUser,
+                                "removed by host");
+                        }
+                        catch (Exception ex) { Log("Disconnect", ex); }
+                        // 3) IClosable 兜底: 直接关闭连接(Disconnect 实测可能静默无效)
+                        try { ((IDisposable)conn).Dispose(); }
+                        catch (Exception ex) { Log("Disconnect", ex); }
+
+                        // 4) 手动清理本路(主动断开不会触发 session.Disconnected 事件)
+                        ConnectionState removed = null;
+                        lock (ConnectionsLock)
+                        {
+                            if (_connections.ContainsKey(conn))
+                            {
+                                removed = _connections[conn];
+                                _connections.Remove(conn);
+                            }
+                        }
+                        removed?.Dispose();
+                        Log("Info", new Exception(
+                            $"Connection removed by host, remaining={_connections.Count}"));
+                        // 连接数变化 → 刷新剩余帧通道读回尺寸
+                        UpdateFrameScales();
+                        Log("Ctrl", new Exception($"RequestDisconnect conn#{state.Index} done"));
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("Disconnect", ex);
+                    }
+                };
+
                 // 自适应缩放:按当前活跃连接数刷新所有帧通道的读回尺寸
                 UpdateFrameScales();
 
@@ -228,6 +321,7 @@ namespace MiracastReceiverService
                 state.MediaPlayer.IsVideoFrameServerEnabled = true;
                 // 实时模式:不缓冲,避免"缓冲耗尽 → 交付停摆"
                 state.MediaPlayer.RealTimePlayback = true;
+                state.FrameServer.MediaPlayerRef = state.MediaPlayer;   // SETMUTE 按连接静音
                 state.MediaPlayer.VideoFrameAvailable += (s, o) => OnVideoFrameAvailable(s, state);
                 state.MediaPlayer.MediaFailed += (s, e) =>
                 {
@@ -244,6 +338,8 @@ namespace MiracastReceiverService
                         state.MediaPlayer = new MediaPlayer();
                         state.MediaPlayer.IsVideoFrameServerEnabled = true;
                         state.MediaPlayer.RealTimePlayback = true;
+                        if (state.FrameServer != null)
+                            state.FrameServer.MediaPlayerRef = state.MediaPlayer;   // 重建后重新挂接 SETMUTE
                         state.MediaPlayer.VideoFrameAvailable += (pl, o) => OnVideoFrameAvailable(pl, state);
                         state.MediaPlayer.PlaybackSession.NaturalVideoSizeChanged += (pl, e2) =>
                             Log("Size", new Exception($"conn#{state.Index} w={pl.NaturalVideoWidth} h={pl.NaturalVideoHeight}"));
@@ -271,6 +367,7 @@ namespace MiracastReceiverService
 
         private static void OnVideoFrameAvailable(MediaPlayer sender, ConnectionState state)
         {
+            state.LastFrameTick = Environment.TickCount;
             var ps = sender.PlaybackSession;
             int w = (int)ps.NaturalVideoWidth;
             int h = (int)ps.NaturalVideoHeight;
@@ -296,7 +393,7 @@ namespace MiracastReceiverService
             var conn = args.Connection;
             Log("Info", new Exception($"Disconnected {conn.Transmitter.Name}"));
             ConnectionState state = null;
-            lock (_connectionsLock)
+            lock (ConnectionsLock)
             {
                 if (_connections.TryGetValue(conn, out state))
                     _connections.Remove(conn);
@@ -306,6 +403,59 @@ namespace MiracastReceiverService
                 state.Dispose();
                 Log("Info", new Exception($"Connection cleaned, remaining={_connections.Count}"));
                 // 自适应缩放:连接数变化, 刷新剩余帧通道的读回尺寸(多路↔单路切换)
+                UpdateFrameScales();
+            }
+        }
+
+        // 无帧超时阈值: 连续 3s 未收到任何视频帧 → 设备已断开(P2P/媒体层静默退出)。
+        // 限帧场景(SETFPS 1)帧间隔 1s, 阈值 3s 留有 2 帧余量, 不会误判。
+        private const int kIdleTimeoutMs = 3000;
+
+        private static void CheckIdleConnections(object _)
+        {
+            List<MiracastReceiverConnection> stale = null;
+            int nowT = Environment.TickCount;
+            lock (ConnectionsLock)
+            {
+                foreach (var kv in _connections)
+                {
+                    var st = kv.Value;
+                    if (st.FrameServer != null && st.LastFrameTick > 0 &&
+                        (nowT - st.LastFrameTick) > kIdleTimeoutMs)
+                    {
+                        (stale ??= new List<MiracastReceiverConnection>()).Add(kv.Key);
+                    }
+                }
+            }
+            if (stale == null)
+                return;
+            foreach (var conn in stale)
+            {
+                ConnectionState state = null;
+                lock (ConnectionsLock)
+                {
+                    if (_connections.TryGetValue(conn, out state))
+                        _connections.Remove(conn);
+                }
+                if (state == null)
+                    continue;
+                Log("Info", new Exception(
+                    $"Source idle {kIdleTimeoutMs}ms, removing conn#{state.Index}"));
+                // 停播放器 + 关帧通道(TCP) → 宿主 FrameClient 断链 → 宿主清画面。
+                // 顺序保持"先停播放器": _running=false 让 SendLoop 正常退出,
+                // 不会走 Environment.Exit(0) 分支误杀共享服务进程。
+                state.Dispose();
+                // 尽力通知设备断开(不依赖, 通道关闭后设备侧终会感知)
+                try { ((IDisposable)conn).Dispose(); }
+                catch (Exception ex) { Log("Idle", ex); }
+                try
+                {
+                    conn.Disconnect(MiracastReceiverDisconnectReason.DisconnectedByUser,
+                                    "source idle");
+                }
+                catch (Exception ex) { Log("Idle", ex); }
+                Log("Info", new Exception(
+                    $"Connection removed (source idle), remaining={_connections.Count}"));
                 UpdateFrameScales();
             }
         }
@@ -322,7 +472,7 @@ namespace MiracastReceiverService
         private static void UpdateFrameScales()
         {
             List<FrameServerSocket> servers;
-            lock (_connectionsLock)
+            lock (ConnectionsLock)
             {
                 servers = new List<FrameServerSocket>(_connections.Count);
                 foreach (var s in _connections.Values)
@@ -352,7 +502,7 @@ namespace MiracastReceiverService
         private static void Cleanup()
         {
             List<ConnectionState> states;
-            lock (_connectionsLock)
+            lock (ConnectionsLock)
             {
                 states = new List<ConnectionState>(_connections.Values);
                 _connections.Clear();
