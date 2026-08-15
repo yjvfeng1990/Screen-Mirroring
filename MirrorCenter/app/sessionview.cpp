@@ -251,11 +251,16 @@ void SessionView::buildUi()
 
     // 信息标签:独立顶层小窗(每个播放窗口一个), 叠加在画面左上角。
     // 必须是顶层窗: 嵌入的 D3D11 视频是原生 HWND, 会盖住普通 Qt 子控件。
+    // 带 parent(本视图)的 Qt::Tool 顶层窗 = Windows owned window:
+    //   系统保证 z-order 恒在本视图(owner)及其子窗口(嵌入视频容器)之上,
+    //   不依赖 raise() 抢次序 —— 无 parent 的平级顶层窗 z-order 不稳定,
+    //   主窗口激活/点击触发条/控制面板弹层都会把它压到视频窗口之下
+    //   (2026-08-16 实测"焦点丢失/点击触发条后信息栏不可见"的根因)。
     // 不设 WindowStaysOnTopHint: 只相对主窗口置顶(z-order 随主窗口一起被其它
     // 应用窗口覆盖, 而不是浮在所有窗口之上)。
     // 跟随主窗口靠事件联动(DesktopWindow::moveEvent → refreshInfoBadge 重定位),
     // 主窗口最小化/还原由 SessionView 的 hideEvent/showEvent 同步隐藏/恢复。
-    m_infoBadge = new QWidget;
+    m_infoBadge = new QWidget(this);
     m_infoBadge->setWindowFlags(Qt::FramelessWindowHint | Qt::Tool);
     m_infoBadge->setAttribute(Qt::WA_ShowWithoutActivating);
     m_infoBadge->setStyleSheet(
@@ -315,6 +320,19 @@ void SessionView::buildUi()
     m_fullBtn->setStyleSheet(btnQss);
     connect(m_fullBtn, &QToolButton::clicked, this, &SessionView::toggleFullscreen);
     badgeL->addWidget(m_fullBtn);
+
+    // 信息栏自动收起交互:
+    //  - 投屏出画时完整显示, 30s 无操作(悬停/点击)自动收缩到只显示设备名
+    //  - 收缩态点击名称展开, 展开后再次 30s 无操作继续收起
+    m_devLabel->setCursor(Qt::PointingHandCursor);
+    m_devLabel->installEventFilter(this);   // 点击名称: 展开收缩态
+    m_infoBadge->installEventFilter(this);  // 悬停/点击: 重置 30s 计时
+    m_badgeCollapseTimer.setInterval(30000);
+    m_badgeCollapseTimer.setSingleShot(true);
+    connect(&m_badgeCollapseTimer, &QTimer::timeout, this, [this]() {
+        if (!m_badgeCollapsed)
+            setBadgeCollapsed(true);   // 30s 无操作: 收缩到名称
+    });
 }
 
 void SessionView::startStandaloneSession()
@@ -393,9 +411,10 @@ void SessionView::adoptManualSession(mirror_session_t *sdkSession, const QString
 SessionView::~SessionView()
 {
     stop();
+    // infoBadge 以本视图为 parent(owned window), 随 Qt 对象树自动销毁。
+    // 不能 deleteLater —— 否则与父对象析构重复释放(double delete)。
     if (m_infoBadge) {
         m_infoBadge->hide();
-        m_infoBadge->deleteLater();
         m_infoBadge = nullptr;
     }
 }
@@ -462,6 +481,8 @@ void SessionView::resetToWaiting()
     m_hasAirPrevFp = false;
     m_netTimer.stop();
     emit firstFrameCleared();
+    m_badgeCollapseTimer.stop();   // 无投屏内容: 停止自动收起计时
+    setBadgeCollapsed(false);      // 复位展开态(下次出画时直接完整显示)
     updateInfoBadge();   // 无内容了:悬浮窗随之隐藏
 }
 
@@ -498,6 +519,7 @@ void SessionView::detach()
     }
     if (m_infoBadge)
         m_infoBadge->hide();
+    m_badgeCollapseTimer.stop();   // 会话分离: 停止自动收起计时
     m_running = false;
     setStatus(QStringLiteral("已断开"));
 }
@@ -783,6 +805,8 @@ void SessionView::renderFrame()
         m_hasFirstFrame = true;
         emit firstFrameReceived();
         updateInfoBadge();   // 有内容了:悬浮窗随之显示并贴紧视图
+        setBadgeCollapsed(false);   // 投屏出画: 信息栏完整显示
+        restartBadgeCollapseTimer();// 30s 无操作后自动收缩
     }
 
     // 帧率/分辨率统计(1s 窗口):分辨率变化时更新标签, 帧率每秒更新
@@ -990,8 +1014,11 @@ void SessionView::attachWindow(qulonglong wid)
         g->addWidget(container, 0, 0);
         container->show();
     }
-    if (m_infoBadge)
+    if (m_infoBadge) {
         updateInfoBadge();   // 窗口嵌入后:悬浮窗显示并贴紧视图, 且置顶
+        setBadgeCollapsed(false);   // 投屏出画: 信息栏完整显示
+        restartBadgeCollapseTimer();// 30s 无操作后自动收缩
+    }
 
     setStatus(QStringLiteral("已连接"));
     // 窗口嵌入成功 = AirPlay 出画:通知主窗口重排(否则视图一直隐藏,
@@ -1012,16 +1039,61 @@ void SessionView::updateInfoBadge()
 {
     if (!m_infoBadge)
         return;
-    // 无投屏内容(尚未出画)或视图不可见:隐藏悬浮窗;有内容才显示并贴紧视图左上角
+    // 无投屏内容(尚未出画)或视图不可见:隐藏悬浮窗;有内容才显示并贴紧视图左下角
     const bool hasContent = m_childWindow || m_hasFirstFrame;
     if (!isVisible() || !hasContent) {
         m_infoBadge->hide();
         return;
     }
-    // 定位到本视图左上角(全局坐标, 主窗口跨屏移动时由 moveEvent 联动重定位)
-    m_infoBadge->move(mapToGlobal(QPoint(12, 12)));
+    // 定位到本视图左下角(全局坐标, 主窗口跨屏移动时由 moveEvent 联动重定位)。
+    // 锚定底部: 收缩/展开(高度变化)时由 setBadgeCollapsed → updateInfoBadge 重新定位,
+    // 底部始终对齐视图底边, 不会随高度伸缩上下漂移。
+    m_infoBadge->move(mapToGlobal(QPoint(12, height() - m_infoBadge->height() - 12)));
     m_infoBadge->show();
     m_infoBadge->raise();
+}
+
+bool SessionView::eventFilter(QObject *obj, QEvent *ev)
+{
+    if (obj == m_devLabel && ev->type() == QEvent::MouseButtonRelease) {
+        // 收缩态点击名称 → 展开完整信息栏; 展开态点击 → 重置自动收起计时
+        if (m_badgeCollapsed)
+            setBadgeCollapsed(false);
+        restartBadgeCollapseTimer();
+        return true;
+    }
+    if (obj == m_infoBadge) {
+        // 悬停/点击信息栏 = 用户有操作意图, 重置 30s 自动收起计时
+        if (ev->type() == QEvent::Enter || ev->type() == QEvent::MouseButtonPress)
+            restartBadgeCollapseTimer();
+    }
+    return QWidget::eventFilter(obj, ev);
+}
+
+void SessionView::setBadgeCollapsed(bool collapsed)
+{
+    if (!m_infoBadge || m_badgeCollapsed == collapsed)
+        return;
+    m_badgeCollapsed = collapsed;
+    // 收缩: 只保留设备名; 展开: 状态/分辨率/帧率/速率/按钮全部显示
+    if (m_statusDot)   m_statusDot->setVisible(!collapsed);
+    if (m_statusLabel) m_statusLabel->setVisible(!collapsed);
+    if (m_resLabel)    m_resLabel->setVisible(!collapsed);
+    if (m_fpsLabel)    m_fpsLabel->setVisible(!collapsed);
+    if (m_rateLabel)   m_rateLabel->setVisible(!collapsed);
+    if (m_muteBtn)     m_muteBtn->setVisible(!collapsed);
+    if (m_fullBtn)     m_fullBtn->setVisible(!collapsed);
+    m_infoBadge->adjustSize();   // 顶层窗需手动按布局重新计算尺寸
+    updateInfoBadge();           // 高度变了: 重新定位(锚定视图底部, 不上下漂移)
+}
+
+void SessionView::restartBadgeCollapseTimer()
+{
+    if (m_badgeCollapsed)
+        return;                    // 已收缩: 计时交由"点击名称展开"重新启动
+    if (!m_infoBadge || !m_infoBadge->isVisible())
+        return;                    // 信息栏不可见时无需计时
+    m_badgeCollapseTimer.start();  // 重启 30s 自动收起
 }
 
 void SessionView::moveEvent(QMoveEvent *e)
@@ -1040,6 +1112,7 @@ void SessionView::showEvent(QShowEvent *e)
 {
     QWidget::showEvent(e);
     updateInfoBadge();
+    restartBadgeCollapseTimer();   // 视图重新可见: 若未收缩则恢复自动收起计时
     // 视图重新可见且仍有画面:恢复缩略图抓取
     if (m_running && m_sdkSession && !m_thumbTimer.isActive())
         m_thumbTimer.start();
@@ -1050,6 +1123,7 @@ void SessionView::hideEvent(QHideEvent *e)
     QWidget::hideEvent(e);
     if (m_infoBadge)
         m_infoBadge->hide();
+    m_badgeCollapseTimer.stop();   // 视图隐藏: 停止自动收起计时
     // 视图不可见(被覆盖/超限):暂停抓图, 省 CPU/GDI
     m_thumbTimer.stop();
 }
@@ -1067,6 +1141,7 @@ void SessionView::toggleMute()
     if (m_muteBtn)
         m_muteBtn->setText(m_muted ? QStringLiteral("🔇") : QStringLiteral("🔊"));
     setStatus(m_muted ? QStringLiteral("已静音") : QStringLiteral("已取消静音"));
+    restartBadgeCollapseTimer();   // 按钮操作 = 有操作, 重置自动收起计时
 }
 
 bool SessionView::applyMute(bool mute)
@@ -1101,6 +1176,7 @@ void SessionView::setMuted(bool mute)
 void SessionView::toggleFullscreen()
 {
     emit fullscreenRequested(m_sessionId);
+    restartBadgeCollapseTimer();   // 按钮操作 = 有操作, 重置自动收起计时
 }
 
 void SessionView::setFullscreenActive(bool active)

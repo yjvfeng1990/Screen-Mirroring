@@ -660,6 +660,10 @@ void DesktopWindow::removeSession(const QString &sessionId)
     // 移除设备需先真正断开, 否则设备仍连着、画面继续解码消耗 CPU。
     // 用 mirror_stop_session 通知后端停止该会话, 网关在设备断开后回收实例。
     if (target->isGatewayMode()) {
+        // 先立即清空画面并释放嵌入窗口(UI 即时反馈): 后端停止是异步的
+        // (mirror_stop_session 排队到 manager 线程, uxplay 进程 terminate 后
+        // 需等待退出, 若等后端停了画面才消失会卡好几秒 —— 2026-08-16 实测)。
+        target->resetToWaiting();
         if (mirror_session_t *s = target->sdkSession())
             mirror_stop_session(s);
         onSessionClosed(sessionId);

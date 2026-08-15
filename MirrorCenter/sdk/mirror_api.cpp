@@ -614,6 +614,11 @@ MIRROR_API mirror_result_t mirror_start_airplay_gateway(
     // 不追加 videosink_options:uxplay 会默认补 force-aspect-ratio=TRUE,
     // 每个格子独立等比显示完整画面(留边不裁切), 保证横竖屏都完整可见。
     cfg.extraArgs << QStringLiteral("-vs") << QStringLiteral("d3d11videosink");
+    // iPhone 休眠(锁屏)时停止反馈/视频流, uxplay 默认 15s 无反馈即 full reset,
+    // 销毁会话 → 解锁后 iOS 端不再重连 → 播放器黑屏。加 -reset 0 = 永不因
+    // 超时 reset:连接保持, 解锁后流自动恢复。真正断开由 TCP 隧道断开清理,
+    // 不依赖该超时机制。
+    cfg.extraArgs << QStringLiteral("-reset") << QStringLiteral("0");
 
     mirror_gateway_callbacks_t cbsCopy{};
     if (cbs)
@@ -838,6 +843,12 @@ MIRROR_API mirror_result_t mirror_start_session(mirror_backend_t backend,
     // 只有指定该 sink 时窗口嵌入才生效;若调用方显式传了 -vs 则尊重其选择。
     if (type == BackendType::AirPlay && !argList.contains(QStringLiteral("-vs"))) {
         argList << QStringLiteral("-vs") << QStringLiteral("d3d11videosink");
+    }
+
+    // 同上:禁用 uxplay feedback 超时 reset(默认 15s), 避免 iPhone 休眠
+    // (锁屏)后解锁播放器黑屏。调用方显式传了 -reset 则尊重其选择。
+    if (type == BackendType::AirPlay && !argList.contains(QStringLiteral("-reset"))) {
+        argList << QStringLiteral("-reset") << QStringLiteral("0");
     }
 
     // AirPlay 多实例:每会话独立 uxplay 进程,分配独立端口组 + 随机 MAC。

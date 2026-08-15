@@ -22,7 +22,10 @@ ControlPanel::ControlPanel(QWidget *parent)
 {
     // 独立顶层 Tool 窗(带 parent 跟随主窗口), 置顶防被 AirPlay 嵌入的 D3D11
     // 渲染窗口(uxplay swap chain)盖住 —— 子控件 raise() 压不住翻转模型渲染
-    // 窗口, 与信息栏 infoBadge 同款方案(Qt::Tool + WindowStaysOnTopHint)。
+    // 窗口, 与信息栏 infoBadge 同款方案(Qt::Tool 独立顶层窗)。
+    // 注意与信息栏的差异: 信息栏(相对窗口置顶)不带 WindowStaysOnTopHint,
+    // 随主窗口一起被其它应用覆盖; 本面板按需求方案带 WindowStaysOnTopHint
+    // 全局置顶。
     // 收起 = hide() 完全隐藏, 展开 = show()+raise() 覆盖在主窗口右侧, 跟随
     // 主窗口最小化/移动(顶层子窗自动跟随 + Move 事件兜底重定位)。
     setWindowFlags(Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);

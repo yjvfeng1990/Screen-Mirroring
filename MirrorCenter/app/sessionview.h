@@ -123,6 +123,8 @@ protected:
     void resizeEvent(QResizeEvent *e) override;
     void showEvent(QShowEvent *e) override;
     void hideEvent(QHideEvent *e) override;
+    // 信息栏交互(悬停重置 30s 计时 / 点击名称展开收缩态)
+    bool eventFilter(QObject *obj, QEvent *ev) override;
 
 private:
     void buildUi();
@@ -143,6 +145,10 @@ private:
     bool thumbChanged(const QImage &thumb);
     /** 信息标签为独立顶层小窗, 跟随本视图左上角悬浮(避免被 D3D11 原生窗口遮挡) */
     void updateInfoBadge();
+    /** 信息栏收缩/展开: 收缩态只保留设备名, 展开态完整显示(30s 无操作自动收缩) */
+    void setBadgeCollapsed(bool collapsed);
+    /** 重置 30s 自动收起计时(悬停/点击信息栏, 或出画展开时调用) */
+    void restartBadgeCollapseTimer();
     /** 静音/取消静音(按会话后端子进程 PID 控制音频会话) */
     void toggleMute();
     /** 执行静音/取消静音: Miracast 按连接 SETMUTE, 其它按进程 PID。返回是否成功。 */
@@ -204,4 +210,7 @@ private:
     bool m_framePending = false;         // 上一帧是否还没在 UI 线程渲染完(节流用)
     bool m_hasFirstFrame = false;        // 是否已收到首帧(Miracast 占位会话据此隐藏)
     bool m_fillMode = false;             // 铺满整格:等比放大覆盖后居中裁剪(无黑边)
+    // 信息栏自动收起(投屏完整显示 → 30s 无操作收缩到名称 → 点击名称展开):
+    bool m_badgeCollapsed = false;       // 信息栏当前是否处于收缩态(只显示名称)
+    QTimer m_badgeCollapseTimer;         // 30s 无操作自动收缩计时
 };
