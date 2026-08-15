@@ -32,6 +32,9 @@ namespace MiracastReceiverService
         private volatile bool _running;
         private Task _sendLoopTask;
 
+        /// 本路帧端口(Program 空闲端口分配用, 连接断开后该端口可被复用)
+        public int Port => _port;
+
         // 单槽最新帧(发送慢于回调时实时丢弃旧帧,避免延迟累积)
         // 重要:VideoFrame 的 D3D surface 不能跨帧复用(CopyFrameToVideoSurface 要求全新 surface),
         // 所以每帧新建。释放(Dispose)一律在 SendLoop 线程执行:

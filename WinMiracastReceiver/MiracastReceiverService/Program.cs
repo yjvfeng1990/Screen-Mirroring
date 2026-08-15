@@ -41,6 +41,7 @@ namespace MiracastReceiverService
         private sealed class ConnectionState : IDisposable
         {
             public int Index;
+            public int Port;              // 帧端口(从 _ports 空闲分配, 连接断开后复用)
             public MediaPlayer MediaPlayer;
             public MediaSource MediaSource;   // 保留源用于失败重试
             public bool MediaRetried;         // 已重试过一次(避免循环重试)
@@ -189,22 +190,35 @@ namespace MiracastReceiverService
                         Log("Info", new Exception("MediaSourceCreated: duplicate connection, ignore"));
                         return;
                     }
-                    int idx = _connections.Count;
-                    if (idx >= _ports.Count)
+                    // 空闲端口分配:不能用 _connections.Count 当索引——连接断开后
+                    // Count 变小会复用仍在线的连接端口(实测: conn#0 断开后新
+                    // 连接拿到 conn#1 的 3030 → 共享内存同名冲突 → 服务退出)。
+                    // 改为扫描 _ports, 取第一个未被当前活跃连接占用的端口。
+                    var used = new HashSet<int>();
+                    foreach (var s in _connections.Values)
+                        if (s.FrameServer != null)
+                            used.Add(s.FrameServer.Port);
+                    int freePort = -1;
+                    foreach (var p in _ports)
                     {
-                        Log("Error", new Exception($"MediaSourceCreated: no frame port left for connection #{idx} (configured={_ports.Count})"));
+                        if (!used.Contains(p)) { freePort = p; break; }
+                    }
+                    if (freePort < 0)
+                    {
+                        Log("Error", new Exception($"MediaSourceCreated: no free frame port (configured={string.Join(",", _ports)})"));
                         return;
                     }
-                    state.Index = idx;
+                    state.Index = _connections.Count;  // 仅用于日志编号
+                    state.Port = freePort;
                     _connections[conn] = state;
                 }
 
                 Log("Info", new Exception($"Connection#{state.Index} MediaSourceCreated name={conn.Transmitter.Name}"));
 
                 // 帧通道:每路独立端口 → 宿主对应 FrameClient 监听 127.0.0.1:<port>
-                state.FrameServer = new FrameServerSocket(_ports[state.Index], $"{_sessionName}-{state.Index}");
+                state.FrameServer = new FrameServerSocket(state.Port, $"{_sessionName}-{state.Index}");
                 await state.FrameServer.StartAsync();
-                Log("Info", new Exception($"Connection#{state.Index} FrameServer connected port {_ports[state.Index]}"));
+                Log("Info", new Exception($"Connection#{state.Index} FrameServer connected port {state.Port}"));
 
                 // 自适应缩放:按当前活跃连接数刷新所有帧通道的读回尺寸
                 UpdateFrameScales();
