@@ -360,6 +360,10 @@ void DesktopWindow::relayout()
     m_grid->setSpacing(fullBleed ? 0 : 4);
 
     if (active.isEmpty()) {
+        // 视图是 m_canvasInner 的子控件, 脱离布局后仍可见(黑色 GLFrameSurface
+        // 会盖住空状态卡片) —— 必须先全部隐藏再显示 emptyCard。
+        for (SessionView *view : m_views)
+            view->hide();
         if (m_emptyCard) {
             m_emptyCard->show();
             m_grid->addWidget(m_emptyCard, 0, 0);

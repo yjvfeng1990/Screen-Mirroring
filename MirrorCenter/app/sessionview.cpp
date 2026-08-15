@@ -251,11 +251,12 @@ void SessionView::buildUi()
 
     // 信息标签:独立顶层小窗(每个播放窗口一个), 叠加在画面左上角。
     // 必须是顶层窗: 嵌入的 D3D11 视频是原生 HWND, 会盖住普通 Qt 子控件。
+    // 不设 WindowStaysOnTopHint: 只相对主窗口置顶(z-order 随主窗口一起被其它
+    // 应用窗口覆盖, 而不是浮在所有窗口之上)。
     // 跟随主窗口靠事件联动(DesktopWindow::moveEvent → refreshInfoBadge 重定位),
     // 主窗口最小化/还原由 SessionView 的 hideEvent/showEvent 同步隐藏/恢复。
     m_infoBadge = new QWidget;
-    m_infoBadge->setWindowFlags(Qt::FramelessWindowHint | Qt::Tool
-                                | Qt::WindowStaysOnTopHint | Qt::BypassWindowManagerHint);
+    m_infoBadge->setWindowFlags(Qt::FramelessWindowHint | Qt::Tool);
     m_infoBadge->setAttribute(Qt::WA_ShowWithoutActivating);
     m_infoBadge->setStyleSheet(
         "QWidget#infoBadge {"
@@ -428,6 +429,27 @@ void SessionView::resetToWaiting()
         m_videoLabel->clearFrame();
     m_hasFirstFrame = false;
     m_lastThumb = QPixmap();
+
+    // 释放嵌入的视频窗口容器(AirPlay d3d11 / Miracast swap chain 窗口)。
+    // 不释放的话 isActive() 仍为 true, 投屏结束后主窗口不会恢复空状态提示。
+    // 同步删除(同 attachWindow: deleteLater 与外部进程互相等待会卡死 UI 线程)。
+    if (m_embeddedHwnd && m_childWindow) {
+        if (auto *g = qobject_cast<QGridLayout *>(this->layout())) {
+            for (int i = g->count() - 1; i >= 0; --i) {
+                QLayoutItem *item = g->itemAt(i);
+                QWidget *w = item ? item->widget() : nullptr;
+                if (w && w != m_infoBadge) {
+                    g->removeWidget(w);
+                    w->setParent(nullptr);
+                    delete w;
+                    break;
+                }
+            }
+        }
+        m_childWindow = nullptr;
+        m_embeddedHwnd = 0;
+    }
+
     // 静音状态重置: 静音是按连接生效的(SETMUTE), 连接断开/移除后旧静音不会
     // 继承到新连接 —— 若不重置, 重新投屏时按钮残留静音图标但实际正常出声。
     m_muted = false;
@@ -553,7 +575,10 @@ QPixmap SessionView::thumbnail() const
 
 bool SessionView::isActive() const
 {
-    return m_gatewayMode || m_childWindow || m_hasFirstFrame;
+    // 有真实内容才算激活(用于主窗口布局/控制面板列表):
+    // m_gatewayMode 只是"句柄由网关提供"的来源标记, 不能让它让断开后的
+    // 视图永远激活(否则投屏结束后主窗口不会恢复空状态提示)。
+    return m_childWindow || m_hasFirstFrame;
 }
 
 QImage SessionView::captureThumbnail()
