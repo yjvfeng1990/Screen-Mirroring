@@ -53,11 +53,22 @@ if errorlevel 1 (
 )
 
 rem release deploy: reuse GStreamer/uxplay from build2, add Qt release DLLs
+rem 注意: set 必须放在 if 括号块外 —— 块内 %VAR% 在解析时展开(此时未赋值, 为空),
+rem 会导致 robocopy/windeployqt 拿到空路径静默失败。
+set SRC=%CD%\MirrorCenter\build2\app
+set DST=%BUILD_DIR%\app
 if "%MODE%"=="release" (
-    set SRC=%CD%\MirrorCenter\build2\app
-    set DST=%BUILD_DIR%\app
     robocopy "%SRC%" "%DST%" /E /XF MirrorCenter.exe mirrorsdk.dll "Qt6*d.dll" *.obj *.pdb *.lib *.ilk /XD CMakeFiles platforms /NFL /NDL /NJH /NJS /NP >nul
-    "%QT_BIN%\windeployqt.exe" --release --no-translations "%DST%\MirrorCenter.exe" >nul
+    rem robocopy 退出码 0-7 为成功, >=8 才是失败
+    if errorlevel 8 (
+        echo [ERROR] robocopy deploy files failed ^(code %errorlevel%^).
+        exit /b 1
+    )
+    "%QT_BIN%\windeployqt.exe" --release --no-translations "%DST%\MirrorCenter.exe"
+    if errorlevel 1 (
+        echo [ERROR] windeployqt failed.
+        exit /b 1
+    )
 )
 
 echo [OK] MirrorCenter.exe -^> %BUILD_DIR%\app\MirrorCenter.exe
