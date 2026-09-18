@@ -330,18 +330,28 @@ void DesktopWindow::relayout()
     // AirPlay 路不走 Miracast 服务, 服务端按自身连接数分档会低估(如
     // 2 Miracast + 1 AirPlay 仍给 1280); 这里按总路数算好 edge 推给每个
     // Miracast 会话, 服务端 SETEDGE 覆盖其默认。
+    //
+    // 全屏独占时(2026-09-18): 焦点路恢复原画质(edge=0 不缩放, 源分辨率读回),
+    // 其余被遮住的路降到最低档(480)——反正已限 1fps, 缩到最低省 CPU/带宽。
+    // 还原后回到按总路数分档。
     const int totalN = active.size();
-    const int edge = totalN >= 10 ? 480
-                   : totalN >= 5  ? 640
-                   : totalN >= 3  ? 960
-                   : totalN >= 2  ? 1280
-                   : 0;
     for (SessionView *view : m_views) {
         if (view->backend() != MIRROR_BACKEND_MIRACAST)
             continue;
         mirror_session_t *s = view->sdkSession();
-        if (s)
-            mirror_set_frame_edge(s, edge);
+        if (!s)
+            continue;
+        int edge;
+        if (m_focusView != nullptr) {
+            edge = (view == m_focusView) ? 0 : 480;
+        } else {
+            edge = totalN >= 10 ? 480
+                 : totalN >= 5  ? 640
+                 : totalN >= 3  ? 960
+                 : totalN >= 2  ? 1280
+                 : 0;
+        }
+        mirror_set_frame_edge(s, edge);
     }
 
     // ---- 快速路径:布局无变化则跳过, 避免切换时重建容器导致闪烁 ----
