@@ -407,9 +407,12 @@ namespace MiracastReceiverService
             }
         }
 
-        // 无帧超时阈值: 连续 3s 未收到任何视频帧 → 设备已断开(P2P/媒体层静默退出)。
-        // 限帧场景(SETFPS 1)帧间隔 1s, 阈值 3s 留有 2 帧余量, 不会误判。
-        private const int kIdleTimeoutMs = 3000;
+        // 无帧超时阈值: 连续 15s 未收到任何视频帧 → 设备已断开(P2P/媒体层静默退出)。
+        // 2026-09-18 实测: Windows 笔记本源熄屏/静态画面/省电时暂停编码(帧率 60→0),
+        // 但 802.11 关联与 RTSP 会话仍在, 3s 即拆连接导致"连一段时间就断开"。
+        // 放宽到 15s: 源侧暂停期间保住会话, 恢复活动后帧自动续传, 无需手动重连。
+        // 限帧场景(SETFPS 1)帧间隔 1s, 15s 阈值余量充足, 不会误判。
+        private const int kIdleTimeoutMs = 15000;
 
         private static void CheckIdleConnections(object _)
         {
