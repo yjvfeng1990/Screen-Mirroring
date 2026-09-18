@@ -307,11 +307,11 @@ void MirrorSession::onFrameIdleTimeout()
     // 仅出画中(WindowReady)才检测:等待态无帧属正常, 不误判
     if (m_state != SessionState::WindowReady)
         return;
-    // 与服务端 kIdleTimeoutMs(15s) 对齐: Windows 源熄屏/静态画面会暂停编码数秒,
-    // 3s 即清画面会造成"暂停一下就黑屏"。15s 内帧恢复则画面保持, 超时才回等待态。
-    if (!m_frameTimer.isValid() || m_frameTimer.elapsed() <= 15000)
+    // 与服务端 kIdleTimeoutMs(5s) 对齐: Windows 源熄屏/静态画面会暂停编码数秒,
+    // 阈值过短(3s)会"暂停一下就黑屏"。5s 内帧恢复则画面保持, 超时才回等待态。
+    if (!m_frameTimer.isValid() || m_frameTimer.elapsed() <= 5000)
         return;
-    emit logMessage(m_id, QStringLiteral("frame idle 15s, treat as source disconnected"));
+    emit logMessage(m_id, QStringLiteral("frame idle 5s, treat as source disconnected"));
     // 帧通道未及时关闭(服务端 Disconnected 事件延迟)时主动回等待态 → UI 清画面。
     // 若随后服务端才关通道, onFrameClientDisconnected 会重复 setState(Starting),
     // 状态相同被去重, 无副作用; 若设备其实重连, 新帧到达后重新出画。
