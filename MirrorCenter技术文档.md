@@ -24,22 +24,54 @@
 - SHM 路径：双槽 ping/pong 共享内存，槽尾 4B seqlock（奇数=写入中，偶数=完整帧）
 - 协议定义见 [frameclient.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/core/frameclient.cpp#L16-L24)
 
-### 1.3 GPU 零拷贝链路（已收口，2026-09-24）
+### 1.3 GPU 零拷贝方案（M1~M4 已收口，2026-09-24）
 
-| 环节 | 实现 | 位置 |
+**收益**：CPU 全程不触碰像素。SHM 基线单路 1080p 占 44% 单核；GPU 模式 2 路 1280x720 服务端 10.9~15.3% + 宿主 8.4~14.6% 单核（含并行 AirPlay）。
+
+**链路架构**：
+
+```
+[UWP 服务端]                                     [桌面宿主]
+MediaPlayer 解码帧(GPU 显存)
+  → CopyFrameToVideoSurface 直拷入
+    D3D11 共享纹理 slot 0/1
+  → 完整帧翻转显示槽指针
+  → TCP 28B 头 stride=0xFFFFFFFF  ────────────→  frameclient 收头(无像素数据)
+                                                  → ensureGpuTextures: OpenSharedResourceByName
+                                                    按名打开两槽共享纹理
+                                                  → blit(): GPU 内 CopyResource 共享→影子纹理
+                                                  → 注册的 GL 纹理着色器采样绘制(缩放/裁切全 GPU)
+```
+
+**共享纹理模式**：
+
+| 模式 | 同步方式 | 状态 |
 |---|---|---|
-| 服务端拷贝 | `CopyFrameToVideoSurface` 直拷入共享纹理 | [FrameServerSocket.cs](file:///d:/develop/Screen%20Mirroring/WinMiracastReceiver/MiracastReceiverService/FrameServerSocket.cs#L114-L130) |
-| 纹理模式 | 默认 **NtOnly**（`SHARED_NTHANDLE` 无 keyed mutex）；KeyedNt 在拷贝器侧被拒 `0x887A0001` 后自动切换 NtOnly | FrameServerSocket.cs |
-| 同步机制 | NtOnly 无 mutex，靠 **2 槽轮换**：写满一帧翻转显示槽指针 | FrameServerSocket.cs |
-| 超频帧 | 限帧跳过的帧**固定写备用槽、不翻转指针**，防止覆盖宿主正在采样的显示槽（撕裂） | FrameServerSocket.cs |
-| 宿主渲染 | WGL_NV_DX_interop2 将 D3D 共享纹理注册为 GL 纹理采样（影子纹理方案；NVIDIA 拒注册按名打开的共享纹理） | [mirrorsession.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/core/mirrorsession.cpp#L121-L162) |
-| 回退防冻结 | frameclient 收到 SHM 头时必须置 `m_gpu.valid = 0`，否则 GPU→SHM 回退后继续采样旧纹理导致画面冻结 | [frameclient.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/core/frameclient.cpp#L266-L293) |
+| KeyedNt | keyed mutex | 拷贝器侧被拒 `0x887A0001` → 自动切换 |
+| **NtOnly（默认生效）** | 无 mutex，**2 槽轮换**：写满一帧翻转显示槽指针，宿主直接读回 | 正常工作 |
+
+- 命名规则：`Local\MirrorCenterSharedTex_<port>_g<gen>_<slot>`（gen 世代防陈旧纹理、port 隔离会话）
+- **超频帧**（限帧跳过的帧）**固定写备用槽、不翻转指针**，防止覆盖宿主正在采样的显示槽（撕裂）
+- 实现位置：服务端 [FrameServerSocket.cs L114-130](file:///d:/develop/Screen%20Mirroring/WinMiracastReceiver/MiracastReceiverService/FrameServerSocket.cs#L114-L130)
+
+**宿主渲染——影子纹理方案**（[d3dinterop.cpp L174-260](file:///d:/develop/Screen%20Mirroring/MirrorCenter/core/d3dinterop.cpp#L174-L260)）：
+- **为什么需要影子纹理**：NVIDIA 拒绝直接注册按名打开的跨进程共享纹理
+- 流程：`OpenSharedResourceByName` 打开共享 D3D 纹理 → 创建同尺寸本地影子纹理（MiscFlags=0）→ 将**影子纹理**注册为 GL 纹理（`wglDXRegisterObjectNV`）
+- 每帧序列（[drawGpu L289-330](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/sessionview.cpp#L289-L330)）：`blit()` GPU 内 `CopyResource`（共享→影子）→ `lock`/acquire → `glDrawArrays` 采样 → `unlock`/release；blit/lock 失败保留上一帧并节流告警
+- `readTexture`：staging 纹理 Map 读回（黑边检测用，见 §1.5）
+
+**回退链**：GPU 打开失败或渲染失败 → SHM 共享内存路径；frameclient 收到 SHM 头时必须置 `m_gpu.valid = 0`，否则 GPU→SHM 回退后继续采样旧纹理导致画面冻结（[frameclient.cpp L266-293](file:///d:/develop/Screen%20Mirroring/MirrorCenter/core/frameclient.cpp#L266-L293)）
 
 关键语义（`OpenSharedResourceByName`）：
 - 只能打开**另一设备**创建的资源，同设备自开返回 `E_INVALIDARG` 是合法响应
 - `Local\` 前缀与无前缀等价；`Global\` 同会话不可见
 - 打开端 `dwDesiredAccess` 必须覆盖创建端授予范围（仅 READ → `0x8876086A` ACCESS_DENIED）
 - 创建端必须持有句柄至 Dispose，提前 CloseHandle 导致命名对象销毁（`0x80070057`）
+
+**验证结论**（[test.md GPU 探针日志](file:///d:/develop/Screen%20Mirroring/test.md) + 真机回归）：
+- 跨设备打开权限探针：READ|QUERY 成功、仅 READ `0x8876086A`（预期拒绝），两模式 × 两槽全过
+- 连续 1376 GPU 帧，23 次跨进程读回验证全部通过，AcquireSync 失败 0，SHM 回退帧 0，像素 lum distinct 91~94 正常
+- 断连回归：强杀服务/宿主双方不崩 PASS
 
 ### 1.4 空闲超时与会话保活
 
@@ -191,6 +223,7 @@ Miracast 命令链（SETMUTE 先存后发）：
 | [sessionview.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/sessionview.cpp) | 单路视图：渲染/黑边检测裁切/静音下发 |
 | [frameclient.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/core/frameclient.cpp) | 帧协议客户端（SHM/GPU 双路径、SETMUTE 先存后发） |
 | [mirrorsession.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/core/mirrorsession.cpp) | Miracast 会话宿主侧（GL 渲染/空闲超时/frameConnected） |
+| [d3dinterop.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/core/d3dinterop.cpp) | D3D-GL 互操作：共享纹理打开/影子纹理注册/blit/读回 |
 | [sessionmanager.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/core/sessionmanager.cpp) / [mirror_api.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/sdk/mirror_api.cpp) | 会话信号转发 / SDK 回调分发（on_frame_link） |
 | [FrameServerSocket.cs](file:///d:/develop/Screen%20Mirroring/WinMiracastReceiver/MiracastReceiverService/FrameServerSocket.cs) | 服务端：GPU 拷贝/共享纹理/SETEDGE/SETMUTE |
 | [Program.cs](file:///d:/develop/Screen%20Mirroring/WinMiracastReceiver/MiracastReceiverService/Program.cs) | 服务端主程序：会话生命周期/空闲拆除 |
