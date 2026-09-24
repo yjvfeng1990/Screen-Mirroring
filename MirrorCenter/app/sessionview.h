@@ -45,9 +45,17 @@ public:
      *  g.valid 必须为 1;纹理名按 mirror_gpu_frame 的 port/gen/slot 规约拼接。 */
     void setFrameGpu(const mirror_gpu_frame_t &g, const QRectF &src, const QRectF &dst);
     void clearFrame();
-    /** GPU 模式黑边检测缓存结果(M3): true = 最近一次读回检测判定为
-     *  "横屏帧内竖屏内容+左右黑边"(2 分屏铺满裁切用); 未检测前 false。 */
-    bool gpuHasSideBars() const { return m_gpuBars == 1; }
+    /** GPU 模式黑边检测缓存结果: true = 最近一次读回检测判定为
+     *  "横屏帧内竖屏内容+左右黑边"(2/3 分屏铺满裁切用); 未检测前 false。
+     *  命中时 *contentXOut/*contentWOut 为内容区左边界/宽度(相对帧宽 0~1),
+     *  裁切到实际内容区(自适应宽高比, 手机 9:16 / PAD 10:16 / 3:4 均不裁内容)。 */
+    bool gpuHasSideBars(double *contentXOut = nullptr,
+                        double *contentWOut = nullptr) const
+    {
+        if (contentXOut)  *contentXOut  = m_gpuBarsX;
+        if (contentWOut)  *contentWOut  = m_gpuBarsW;
+        return m_gpuBars == 1;
+    }
 
 protected:
     void initializeGL() override;
@@ -78,7 +86,12 @@ private:
     // GPU 模式黑边检测(drawGpu 每 2s 读回一帧, 见 hasSideBars):
     // -1 未检测(按整帧处理), 0 无黑边, 1 有黑边(竖屏内容)
     int m_gpuBars = -1;
+    int m_gpuBarsHits = 0;               // 置位消抖:连续检出次数(≥2 次才生效)
     QElapsedTimer m_gpuBarsTimer;        // 上次检测节流
+    double m_gpuBarsX = 0.0;             // 命中时内容区左边界(相对帧宽)
+    double m_gpuBarsW = 1.0;             // 命中时内容区宽度(相对帧宽)
+    QElapsedTimer m_gpuTexOpenAt;        // 纹理(重)开时刻: 刚重开时纹理内容
+                                         // 未就绪, 读回全黑会误判"无黑边"
 };
 
 /**
@@ -151,6 +164,9 @@ signals:
     void firstFrameCleared();
     /** 设备真实名称已上报(服务端经帧通道 MCCTRL1 NAME: 送达) */
     void clientNameChanged(const QString &name);
+    /** 帧链路已建立(仅 Miracast: 服务端连入, 早于首帧/出声)。
+     *  早静音(2026-09-25): 主窗口在此应用新连接音频默认值, SETMUTE 先于出声。 */
+    void sessionConnected();
     /** 用户手动切换了音频开关(DesktopWindow 据此更新音频焦点路选举) */
     void audioToggled();
 
@@ -201,6 +217,7 @@ private:
     static void onFrameCallback(mirror_session_t *session, void *userdata);
     static void onClientInfoCallback(mirror_session_t *session, const char *name,
                                      const char *model, void *userdata);
+    static void onFrameLinkCallback(mirror_session_t *session, void *userdata);
 
     QString m_sessionId;
     QString m_deviceName;
@@ -225,6 +242,7 @@ private:
     bool m_muted            = false;
     bool m_muteApplied      = false;     // m_muted 是否已成功下发到后端/进程
     bool m_muteRetryPending = false;     // 静音下发重试定时器在途
+    int  m_muteFastRetries  = 0;         // 窗口嵌入前 500ms 快速重试计数(上限 20 次)
     bool m_running          = false;
     QTimer m_thumbTimer;                 // 缩略图抓取节拍(内容变化时 1.2s, 静止时 3s)
     QPixmap m_lastThumb;                 // 最近一帧缩略图
@@ -250,6 +268,10 @@ private:
     bool m_framePending = false;         // 上一帧是否还没在 UI 线程渲染完(节流用)
     bool m_hasFirstFrame = false;        // 是否已收到首帧(Miracast 占位会话据此隐藏)
     bool m_fillMode = false;             // 铺满整格:等比放大覆盖后居中裁剪(无黑边)
+    int m_shmBarsHits = 0;               // SHM 黑边检测消抖:连续命中帧数(≥12 才生效)
+    QRectF m_lastFillDst;                // fill 上次目标矩形: 黑边每 2s 重测有像素级
+                                         // 抖动, 死区(<10px)内沿用上次窗口不调整,
+                                         // 差值由 src 等比微调吸收(用户要求窗口稳定)
     // 信息栏自动收起(投屏完整显示 → 30s 无操作收缩到名称 → 点击名称展开):
     bool m_badgeCollapsed = false;       // 信息栏当前是否处于收缩态(只显示名称)
     QTimer m_badgeCollapseTimer;         // 30s 无操作自动收缩计时

@@ -32,17 +32,23 @@
 
 // ---- GLFrameSurface:GPU 纹理上传 + GPU 着色器缩放/裁切绘制 ----
 
-// 判断横屏帧左右边缘是否有足够宽的纯黑边(安卓竖屏投屏的特征)。
+// 判断横屏帧左右边缘是否有足够宽的纯黑边(安卓竖屏投屏的特征:横屏帧内嵌竖屏内容)。
 // 只判断"有无黑边", 不做内容边界采样 → 内容深色不会被误判裁切。
-// 要求: 左右各至少 minBlack 列连续近黑(平均亮度<16), 双侧同时成立才视为竖屏内容。
+// 要求: 双侧同时成立才视为竖屏内容, 单侧黑边不算。
+// 阈值收紧到帧宽 22%: 竖屏源(最宽 3:4)在 16:9 横屏帧内黑边每侧约 29%,
+// 9:16 源约 34%; 横屏内容偶尔的窄黑边/深色边(<22%)不再误判 → 横屏不裁。
+// 另要求中央内容区非黑: 转场/闪黑的全黑帧两侧也能数出"黑边", 用中央亮度排除。
+// 瞬态残留由调用方消抖(GPU 连续 2 次检测 / SHM 连续 12 帧)。
 // SHM 路径逐帧检测; GPU 路径由 drawGpu 每 2s 读回一帧检测(结果缓存)。
-static bool hasSideBars(const QImage &img)
+// 命中时带出左右黑边实际像素宽 → 调用方裁到实际内容区(自适应宽高比,
+// 手机 9:16 / PAD 10:16 / 3:4 均完整保留, 不再固定裁 9:16)。
+static bool hasSideBars(const QImage &img, int *lbOut = nullptr, int *rbOut = nullptr)
 {
     const int w = img.width(), h = img.height();
     if (w < 64 || h < 16 || img.format() != QImage::Format_RGB32)
         return false;
     const int rows[3] = { h * 3 / 8, h / 2, h * 5 / 8 };
-    const int minBlack = qMax(16, w / 12);   // 单侧黑边最小宽度(约帧宽 8%)
+    const int minBlack = w * 22 / 100;        // 单侧黑边最小宽度(竖屏源理论 ≥29%)
     const int darkTh = 16;                    // 近黑亮度阈值
     auto colDark = [&](int x) {
         int sum = 0;
@@ -60,7 +66,24 @@ static bool hasSideBars(const QImage &img)
     for (int x = w - 1; x > w / 2; --x) {
         if (colDark(x)) ++rb; else break;
     }
-    return lb >= minBlack && rb >= minBlack;
+    if (lb < minBlack || rb < minBlack)
+        return false;
+    // 中央 30% 宽度区间须有内容(亮度 ≥ 阈值): 排除转场/闪黑的全黑帧
+    const int cx0 = w * 7 / 20, cx1 = w * 13 / 20;
+    int sum = 0, n = 0;
+    for (int i = 0; i < 3; ++i) {
+        const uchar *line = img.constScanLine(rows[i]);
+        for (int k = 0; k < 5; ++k) {
+            const uchar *p = line + (cx0 + (cx1 - cx0) * k / 4) * 4;  // BGRA
+            sum += (p[2] + p[1] + p[0]) / 3;
+            ++n;
+        }
+    }
+    if (sum / n < darkTh)
+        return false;
+    if (lbOut) *lbOut = lb;
+    if (rbOut) *rbOut = rb;
+    return true;
 }
 
 GLFrameSurface::GLFrameSurface(QWidget *parent)
@@ -118,8 +141,6 @@ void GLFrameSurface::initializeGL()
     }
     m_gpuOpen = false;
     m_gpuOpenFailed = false;
-    m_gpuBars = -1;
-    m_gpuBarsTimer.invalidate();
 }
 
 void GLFrameSurface::setFrame(const QImage &img, const QRectF &src, const QRectF &dst)
@@ -169,6 +190,13 @@ void GLFrameSurface::clearFrame()
     }
     m_gpuActive = false;
     m_gpuPending = mirror_gpu_frame_t{};
+    // 黑边判定重置(会话拆除/槽位复用): 新设备源方向未知, 重新检测。
+    // 注意 releaseGpuTextures 里故意不清(分档切换跨纹理重建保留判定)。
+    m_gpuBars = -1;
+    m_gpuBarsHits = 0;
+    m_gpuBarsX = 0.0;
+    m_gpuBarsW = 1.0;
+    m_gpuBarsTimer.invalidate();
     releaseGpuTextures();   // 共享纹理随断连一并注销(服务端环已销毁)
     doneCurrent();
     m_src = m_dst = QRectF();
@@ -202,9 +230,9 @@ void GLFrameSurface::releaseGpuTextures()
     m_gpuOpenPort = 0;
     m_gpuOpenW = m_gpuOpenH = 0;
     m_gpuOpenFailed = false;
-    // 检测结果随纹理环一并失效(断连/世代/尺寸变化后需重新检测)
-    m_gpuBars = -1;
-    m_gpuBarsTimer.invalidate();
+    // 注意: 黑边判定(m_gpuBars)跨纹理重建保留 —— 分档切换/世代重开只是
+    // 等比缩放, 黑边相对宽度不变, 保留判定避免已铺满画面回落整帧再拉升
+    // (新增一路触发 relayout 时所有源闪缩)。真正重置点在 clearFrame()。
 }
 
 /// 打开/重开 GPU 共享纹理(世代/端口/尺寸/上下文任一变化)。paintGL 内调用(上下文 current)。
@@ -252,6 +280,7 @@ bool GLFrameSurface::ensureGpuTextures()
     m_gpuOpenW = g.width;
     m_gpuOpenH = g.height;
     m_gpuOpenFailed = false;
+    m_gpuTexOpenAt.restart();   // 黑边检测在重开后宽限 400ms(见 drawGpu)
     qInfo() << "[GL] GPU shared textures opened gen" << g.gen
             << g.width << "x" << g.height;
     return true;
@@ -298,19 +327,49 @@ bool GLFrameSurface::drawGpu(QOpenGLFunctions *gl)
             m_prog->disableAttributeArray(uvLoc);
             m_prog->release();
             m_dx->unlock(m_gpuObj[slot]);
-            // GPU 模式黑边检测(2 分屏铺满裁切用, M3): GPU 模式无逐帧 CPU 像素,
+            // GPU 模式黑边检测(2/3 分屏铺满裁切用): GPU 模式无逐帧 CPU 像素,
             // 每 2s 读回一帧跑与 SHM 相同的 hasSideBars 判定(横屏帧内竖屏内容
             // 特征)。读回 = staging Map(约 3.5MB PCIe 拷贝, 秒级一次开销可忽略),
-            // 结果缓存 m_gpuBars 供 SessionView::renderFrame 取中央 9:16 区域。
+            // 结果缓存 m_gpuBars + 内容区比例(m_gpuBarsX/W) 供 renderFrame
+            // 裁到实际内容区(自适应宽高比, 不再固定 9:16)。
             // 竖屏帧无需检测; 成败都重启计时(防读回失败时逐帧重试)。
-            // 内容旋转后最迟 2s 适应; 未检测(-1)时 renderFrame 按整帧处理。
+            // 纹理(重)开后 400ms 内不检测: 新纹理内容未就绪, 读回全黑会被
+            // 中央非黑校验判"无黑边" → 已铺满源在分档切换瞬间误清(闪缩)。
+            // 置位策略: 会话初期(未判定 -1)首次检出即铺满 —— 接入画面就是
+            // 源的真实方向, 无转场闪黑风险; 未判定态 0.5s 快速重检(新会话
+            // 首帧可能是桌面/启动画面, 尽快定型, 否则整帧缩显最长 2s 后才
+            // 拉升 —— 2026-09-25 真机"2→3 路新增 1 路缩小再拉升"根因);
+            // 播放中 0→1 翻转需连续 2 次(相隔 2s)都检出 —— 横屏内容的转场/
+            // 闪黑瞬态不触发铺满; 失效(检出无黑边)立即还原, 旋转适应最迟 2s。
             const bool framePortrait = m_gpuOpenH > m_gpuOpenW;
+            const int detectMs = (m_gpuBars == -1) ? 500 : 2000;
             if (!framePortrait
-                && (!m_gpuBarsTimer.isValid() || m_gpuBarsTimer.elapsed() > 2000)) {
+                && (!m_gpuBarsTimer.isValid() || m_gpuBarsTimer.elapsed() > detectMs)
+                && (!m_gpuTexOpenAt.isValid() || m_gpuTexOpenAt.elapsed() > 400)) {
                 m_gpuBarsTimer.restart();
                 QImage rd;
-                if (m_dx->readTexture(m_gpuObj[slot], rd) && !rd.isNull())
-                    m_gpuBars = hasSideBars(rd) ? 1 : 0;
+                if (m_dx->readTexture(m_gpuObj[slot], rd) && !rd.isNull()) {
+                    int lb = 0, rb = 0;
+                    if (hasSideBars(rd, &lb, &rb)) {
+                        m_gpuBarsX = lb / double(rd.width());
+                        m_gpuBarsW = (rd.width() - lb - rb) / double(rd.width());
+                        if (m_gpuBars == -1) {
+                            m_gpuBars = 1;
+                            qInfo() << "[GL] side bars detected, fill on (first check)"
+                                    << "content x/w =" << m_gpuBarsX << m_gpuBarsW;
+                        } else if (m_gpuBars == 0 && ++m_gpuBarsHits >= 2) {
+                            m_gpuBars = 1;
+                            qInfo() << "[GL] side bars detected, fill on (debounced)"
+                                    << "content x/w =" << m_gpuBarsX << m_gpuBarsW;
+                        }
+                    } else {
+                        m_gpuBarsHits = 0;
+                        if (m_gpuBars != 0) {
+                            m_gpuBars = 0;
+                            qInfo() << "[GL] side bars cleared, fill off";
+                        }
+                    }
+                }
             }
             static bool s_gpuDrawLogged = false;   // paintGL 单线程, 静态安全
             if (!s_gpuDrawLogged) {
@@ -574,6 +633,7 @@ void SessionView::startStandaloneSession()
     cbs.on_window = &SessionView::onWindowCallback;
     cbs.on_log    = &SessionView::onLogCallback;
     cbs.on_frame  = &SessionView::onFrameCallback;
+    cbs.on_frame_link = &SessionView::onFrameLinkCallback;
 
     mirror_session_t *session = nullptr;
     const QByteArray nameUtf8 = m_deviceName.toUtf8();
@@ -606,6 +666,7 @@ void SessionView::attachCallbacks()
     cbs.on_log    = &SessionView::onLogCallback;
     cbs.on_frame  = &SessionView::onFrameCallback;
     cbs.on_client_info = &SessionView::onClientInfoCallback;
+    cbs.on_frame_link = &SessionView::onFrameLinkCallback;
     mirror_set_callbacks(m_sdkSession, &cbs, this);
 }
 
@@ -680,6 +741,8 @@ void SessionView::resetToWaiting()
     m_hasFirstFrame = false;
     m_muteApplied = false;   // 会话拆除:静音下发状态失效, 重连后经首帧重断言
     m_lastThumb = QPixmap();
+    m_shmBarsHits = 0;       // 黑边检测消抖计数随会话一并重置(新源重新计数)
+    m_lastFillDst = QRectF(); // fill 窗口稳定死区基准随会话重置(新源重新起算)
 
     // 释放嵌入的视频窗口容器(AirPlay d3d11 / Miracast swap chain 窗口)。
     // 不释放的话 isActive() 仍为 true, 投屏结束后主窗口不会恢复空状态提示。
@@ -968,24 +1031,42 @@ void SessionView::renderFrame()
         }
     }
     // ---- 布局计算:缩放/裁切/留边全部由 GPU 完成, CPU 仅算矩形 ----
-    // 铺满仅用于 2 分屏:竖屏视频铺满格子, 横屏视频保持原比例(完整可见);
-    // 其它分屏(1 屏/3 屏以上)一律保持原比例。只看视频方向, 与格子方向无关。
-    // 铺满采用"高度优先":高度 100% 显示(内容不裁切), 宽度超出才裁左右,
-    // 不足则居中留深色边 —— 避免竖屏视频上下被裁掉一截。
-    const bool framePortrait = fh > fw;
-    // 横屏帧:2 分屏下先判断帧左右边缘是否有足够宽的纯黑边(竖屏内容特征)。
-    // 有黑边 → 取帧中央固定 9:16 区域(不做内容边界采样, 深色内容不会被误裁);
-    // 无黑边(真横屏内容) → 整帧原样显示, 不做任何裁切。
+    // 铺满仅用于 2/3 分屏:竖屏视频铺满竖格, 其余保持原比例。
+    // 帧本身竖屏 → 直接铺; 横屏帧保持原比例, 但安卓竖屏投屏的帧常是
+    // "横屏帧内嵌竖屏内容+左右大黑边": 检出双侧 ≥22% 纯黑边 → 裁到检出
+    // 的实际内容区(自适应宽高比: 手机 9:16 / PAD 10:16 / 3:4 均完整,
+    // 不做内容边界采样, 深色内容不会被误裁; 2026-09-25 修 HONOR Pad
+    // 内容被固定 9:16 裁切不全 —— PAD 竖屏内容比 9:16 宽)。
+    // 真横屏内容(黑边不足/单侧)整帧原样显示, 不裁(2026-09-25 定稿)。
     // GPU 模式无逐帧 CPU 像素: 检测由 drawGpu 每 2s 读回一帧完成,
     // 此处用缓存结果(未检测到首结果前按整帧处理)。
+    const bool framePortrait = fh > fw;
     QRect barRect(0, 0, fw, fh);
-    const bool sideBars = gpuMode ? m_videoLabel->gpuHasSideBars()
-                                  : hasSideBars(img);
-    if (m_fillMode && !framePortrait && sideBars) {
-        const int ch = fh;
-        const int cw = qMin(ch * 9 / 16, fw);
-        barRect = QRect((fw - cw) / 2, 0, cw, ch);
+    // SHM 逐帧检测消抖: 连续 12 帧(约 0.2~0.4s)命中才生效, 转场/闪黑瞬态
+    // 不触发铺满; 检出无黑边立即还原。GPU 路径的消抖在 drawGpu 内完成。
+    bool sideBars = false;
+    QRect contentRect;          // 检出的内容区(横屏帧内竖屏内容)
+    if (gpuMode) {
+        double bx = 0.0, bw = 1.0;
+        sideBars = m_videoLabel->gpuHasSideBars(&bx, &bw);
+        if (sideBars) {
+            const int cw = qBound(1, int(fw * bw + 0.5), fw);
+            const int cx = qBound(0, int(fw * bx + 0.5), fw - cw);
+            contentRect = QRect(cx, 0, cw, fh);
+        }
+    } else {
+        int lb = 0, rb = 0;
+        if (hasSideBars(img, &lb, &rb)) {
+            sideBars = ++m_shmBarsHits >= 12;
+            if (sideBars)
+                contentRect = QRect(lb, 0, fw - lb - rb, fh);
+        } else {
+            m_shmBarsHits = 0;
+        }
     }
+    // 裁切仅 2/3 分屏铺满场景(m_fillMode)生效, 其余分档整帧原样(定稿策略)
+    if (m_fillMode && !framePortrait && sideBars)
+        barRect = contentRect;
     // 内容为竖屏(帧本身竖屏, 或横屏帧内取出的内容区竖屏)才铺满
     const bool contentPortrait = framePortrait || barRect.width() < barRect.height();
     const bool fill = m_fillMode && contentPortrait;
@@ -995,20 +1076,53 @@ void SessionView::renderFrame()
     if (fill) {
         // 高度优先铺满:高度 100%(上下不裁), 宽度超出才裁左右, 不足居中留边
         // 2026-08-16:裁切仅左右各留 30px 黑边, 上下贴满格子边缘。
+        // 2026-09-25 修 HONOR Pad 3 路内容不全:src 已是检测出的真实内容区
+        // (黑边早已裁掉), 高度铺满若宽度溢出, 裁的就是真内容 —— 3 路一行
+        // 三屏格子(宽高比 ~0.59)比 Pad 竖屏内容(10:16=0.625)更窄, 高度优先
+        // 必然溢出裁切。改为: 宽度溢出时退化为宽度优先铺满(宽 100%, 高度
+        // 不足居中留边), 内容永远完整; 2 路横格子场景数值不变。
+        // 窗口稳定(用户要求"加10的黑边"): 黑边每 2s 重测有像素级抖动,
+        // dst 直接跟随会一直微调 —— 与上次 dst 差 <10px 时沿用上次矩形,
+        // 差值由 src 反向等比微调(cover, 边缘 ≤10px)吸收; 真实变化
+        // (旋转/布局切换/格子 resize)超死区才更新窗口。
         const double inset = 30.0;
         const double availW = target.width() - inset * 2;
         const double availH = target.height();
-        const double s = availH / src.height();
-        const double fitW = src.width() * s;
+        const double sH = availH / src.height();
+        const double fitW = src.width() * sH;
+        QRectF want;
         if (fitW >= availW) {
-            dst = QRectF(inset, 0, availW, availH);
-            const double needW = src.width() * availW / fitW;
-            const double dx = (src.width() - needW) / 2.0;
-            src = QRectF(src.left() + dx, src.top(), needW, src.height());
+            const double sW = availW / src.width();
+            const double fitH = src.height() * sW;
+            want = QRectF(inset, (availH - fitH) / 2.0, availW, fitH);
         } else {
-            dst = QRectF(inset + (availW - fitW) / 2.0, 0, fitW, availH);
+            want = QRectF(inset + (availW - fitW) / 2.0, 0, fitW, availH);
+        }
+        const double drift = qMax(qMax(qAbs(want.left() - m_lastFillDst.left()),
+                                       qAbs(want.top() - m_lastFillDst.top())),
+                                  qMax(qAbs(want.width() - m_lastFillDst.width()),
+                                       qAbs(want.height() - m_lastFillDst.height())));
+        if (!m_lastFillDst.isNull() && drift < 10.0) {
+            dst = m_lastFillDst;   // 死区内: 窗口纹丝不动
+        } else {
+            m_lastFillDst = want;
+            dst = want;
+        }
+        // src 适配 dst 实际宽高比(居中 cover): 死区吸收产生的差值
+        // 由边缘 ≤10px 的等比微裁消化, 保证采样不变形
+        const double dstRatio = dst.width() / dst.height();
+        const double srcRatio = src.width() / src.height();
+        if (srcRatio > dstRatio) {
+            const double nw = src.height() * dstRatio;
+            src = QRectF(src.left() + (src.width() - nw) / 2.0, src.top(),
+                         nw, src.height());
+        } else if (srcRatio < dstRatio) {
+            const double nh = src.width() / dstRatio;
+            src = QRectF(src.left(), src.top() + (src.height() - nh) / 2.0,
+                         src.width(), nh);
         }
     } else {
+        m_lastFillDst = QRectF();   // 退出铺满后下次重新起算
         // 等比留边:完整可见, 居中
         const double s = qMin(target.width() / src.width(),
                               target.height() / src.height());
@@ -1376,10 +1490,11 @@ bool SessionView::applyMute(bool mute)
         setStatus(QStringLiteral("后端未就绪"));
         return false;
     }
-    // 空闲实例(设备未连入, 窗口未嵌入)没有音频流可静: 视为已应用,
-    // 避免对预置实例空报"未找到音频会话"; 设备连入时 attachWindow 重断言。
-    if (!m_childWindow)
-        return true;
+    // 不再要求窗口已嵌入(2026-09-25 早静音): 音频会话可能早于视频窗口激活,
+    // 有 pid 即尝试 WASAPI 静音, 压缩"新连接先出声再被静音"的窗口。
+    // 旧实现无窗口时返回 true"视为已应用"会伪标记 m_muteApplied,
+    // 导致 attachWindow/首帧重断言被去重跳过 → 该路永不静音。
+    // 未激活音频会话的实例(设备尚未出声)此处返回 false, 由重试/重断言接力。
     return mirrorui::setProcessAudioMute(pid, mute);
 }
 
@@ -1399,25 +1514,34 @@ void SessionView::setMuted(bool mute)
     m_muteApplied = mute;
 }
 
-// 静音下发重试: WASAPI 音频会话在设备连入/音频流激活后才出现在枚举列表,
-// 过早下发会"未找到"。失败后周期重试; 回到等待态(设备断开)则停止,
-// 由 attachWindow/首帧重断言接力。
+// 静音下发重试: WASAPI 音频会话在设备音频流激活后才出现在枚举列表,
+// 过早下发会"未找到"。失败后周期重试 —— 窗口嵌入前(连接建立期)用短间隔
+// 500ms 快速补静音(音频会话可能早于视频窗口激活, 早静音关键窗口),
+// 嵌入后回退 2s; 回到等待态(设备断开)则停止, 由 attachWindow/首帧重断言接力。
 void SessionView::scheduleMuteRetry()
 {
     if (m_muteRetryPending)
         return;
     m_muteRetryPending = true;
-    QTimer::singleShot(2000, this, [this]() {
+    // 窗口嵌入前(连接建立期)前 ~10s 用 500ms 快速补静音, 之后回退 2s
+    // (防异常会话无限刷"未找到音频会话"日志)
+    int interval = 2000;
+    if (!m_childWindow && m_muteFastRetries < 20) {
+        interval = 500;
+        ++m_muteFastRetries;
+    }
+    QTimer::singleShot(interval, this, [this]() {
         m_muteRetryPending = false;
         if (m_muteApplied == m_muted)
             return;   // 已同步(重断言路径可能已处理)
-        if (!m_running || (!m_childWindow && !m_hasFirstFrame))
+        if (!m_running)
             return;   // 会话结束/回等待态: 停止重试
         if (!applyMute(m_muted)) {
             scheduleMuteRetry();
             return;
         }
         m_muteApplied = m_muted;
+        m_muteFastRetries = 0;
     });
 }
 
@@ -1459,6 +1583,19 @@ void SessionView::onClientInfoCallback(mirror_session_t *session, const char *cl
     const QString model = QString::fromUtf8(client_model ? client_model : "");
     QMetaObject::invokeMethod(self, [self, name, model]() {
         self->setClientInfo(name, model);
+    }, Qt::QueuedConnection);
+}
+
+void SessionView::onFrameLinkCallback(mirror_session_t *session, void *userdata)
+{
+    Q_UNUSED(session)
+    auto *self = static_cast<SessionView *>(userdata);
+    if (!self)
+        return;
+    // 帧链路建立(服务端连入, 早于首帧/出声): 通知主窗口应用新连接音频默认值。
+    // 静音意图此时记录并立即下发(SETMUTE 先于服务端 MediaPlayer 出声)。
+    QMetaObject::invokeMethod(self, [self]() {
+        emit self->sessionConnected();
     }, Qt::QueuedConnection);
 }
 

@@ -91,6 +91,10 @@ signals:
     void windowReady(const QString &id, qulonglong handle);
     void logMessage(const QString &id, const QString &message);
     void frameReady(const QString &id);
+    /// 帧链路已建立(服务端连入, 早于首帧/出声)。
+    /// 早静音(2026-09-25): 宿主在此时应用新连接音频默认值, SETMUTE 先于
+    /// 服务端 MediaPlayer 创建到达 → 新连接首声前即按意图静音。
+    void frameConnected(const QString &id);
     /// 投屏设备真实名称(服务端经帧通道上报, 如 "Honor 10")
     void clientInfoChanged(const QString &id, const QString &name, const QString &model);
 

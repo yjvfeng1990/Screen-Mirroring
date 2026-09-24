@@ -31,6 +31,8 @@ MirrorSession *SessionManager::createSession(BackendType type,
             this, [this, id](const QString &, qulonglong h) { emit sessionWindowReady(id, h); });
     connect(session, &MirrorSession::frameReady,
             this, [this, id](const QString &) { emit sessionFrameReady(id); });
+    connect(session, &MirrorSession::frameConnected,
+            this, [this, id](const QString &) { emit sessionFrameConnected(id); });
     connect(session, &MirrorSession::clientInfoChanged,
             this, [this, id](const QString &, const QString &n, const QString &m) { emit sessionClientInfo(id, n, m); });
     connect(session, &MirrorSession::logMessage,

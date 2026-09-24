@@ -92,6 +92,12 @@ typedef void (*mirror_client_info_callback)(mirror_session_t *session,
                                             const char *client_model,
                                             void *userdata);
 
+/* 帧链路已建立(仅 Miracast 帧模式: 服务端连入, 早于首帧/出声)。
+ * 宿主早静音(2026-09-25): 在此回调中应用新连接音频默认值,
+ * SETMUTE 先于服务端 MediaPlayer 创建到达 → 新连接首声前即静音。 */
+typedef void (*mirror_frame_link_callback)(mirror_session_t *session,
+                                           void *userdata);
+
 typedef struct mirror_callbacks {
     mirror_state_callback  on_state;
     mirror_window_callback on_window;
@@ -99,6 +105,8 @@ typedef struct mirror_callbacks {
     mirror_frame_callback  on_frame;
     /* 来源手机信息(名称/型号)就绪 */
     mirror_client_info_callback on_client_info;
+    /* 帧链路建立(服务端连入, 早于首帧)。可为空。 */
+    mirror_frame_link_callback  on_frame_link;
 } mirror_callbacks_t;
 
 /* ---- 网关(单广播名 + 多静默实例调度) ---- */

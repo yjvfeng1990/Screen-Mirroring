@@ -128,12 +128,24 @@ void FrameClient::onNewConnection()
     m_headerParsed = false;
     m_width = m_height = m_stride = m_payloadSize = m_slot = 0;
     qInfo() << "[frame] client connected:" << m_socket->peerAddress().toString();
+    // 早静音(2026-09-25): 服务端连入瞬间补发缓存的静音意图 —— 此刻服务端
+    // MediaPlayer 尚未创建(Program 在帧通道建立后才建), SETMUTE 先存于服务端
+    // FrameServer.TargetMuted, Play() 前应用 → 新连接首声前即静音。
+    if (m_pendingMute >= 0) {
+        const QByteArray cmd =
+            "SETMUTE " + QByteArray::number(m_pendingMute) + "\n";
+        m_socket->write(cmd);
+        m_socket->flush();
+        qInfo() << "[frame] send SETMUTE" << m_pendingMute
+                << "(port" << m_port << ", on connect)";
+    }
     emit clientConnected();
 }
 
 void FrameClient::onClientDisconnected()
 {
     qWarning() << "[frame] client disconnected";
+    m_pendingMute = -1;   // 重置静音意图: 重连后由新连接音频策略重新决策
     m_latestFrame = QImage();
     m_videoSize = QSize();
     m_headerParsed = false;
@@ -184,6 +196,9 @@ void FrameClient::setTargetEdge(int edge)
 
 void FrameClient::setTargetMute(bool mute)
 {
+    // 先存后发(2026-09-25): socket 未连上(设备未接入)时不再静默丢弃 ——
+    // 服务端连入瞬间(onClientConnected)按缓存补发, 早于服务端 MediaPlayer 出声。
+    m_pendingMute = mute ? 1 : 0;
     if (!m_socket || !m_socket->isValid())
         return;
     QByteArray cmd = "SETMUTE " + QByteArray::number(mute ? 1 : 0) + "\n";

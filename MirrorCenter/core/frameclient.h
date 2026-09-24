@@ -113,6 +113,9 @@ private:
     // 双缓冲:复用两块 QImage, 避免每帧 8MB(1080p BGRA)分配+释放。
     // tryParseFrame 写到"非显示中"的 buffer, 再整体换手给 m_latestFrame(隐式共享,零拷贝)。
     QImage m_ping, m_pong;
+    // 目标静音意图缓存(-1=未设置): 服务端连入即补发, 保证新连接首声前按意图静音;
+    // socket 未连上时 setTargetMute 不再静默丢弃。断开时重置(重连后由策略重新决策)。
+    int m_pendingMute = -1;
 };
 
 } // namespace mirror

@@ -328,6 +328,9 @@ namespace MiracastReceiverService
                 // 实时模式:不缓冲,避免"缓冲耗尽 → 交付停摆"
                 state.MediaPlayer.RealTimePlayback = true;
                 state.FrameServer.MediaPlayerRef = state.MediaPlayer;   // SETMUTE 按连接静音
+                // 早静音(2026-09-25): 宿主可能在帧通道建立时(早于本处)已下发 SETMUTE,
+                // 意图存于 FrameServer.TargetMuted —— Play() 前补应用, 首声即按意图静音。
+                state.FrameServer.ApplyPendingMute();
                 state.MediaPlayer.VideoFrameAvailable += (s, o) => OnVideoFrameAvailable(s, state);
                 state.MediaPlayer.MediaFailed += (s, e) =>
                 {
@@ -345,7 +348,12 @@ namespace MiracastReceiverService
                         state.MediaPlayer.IsVideoFrameServerEnabled = true;
                         state.MediaPlayer.RealTimePlayback = true;
                         if (state.FrameServer != null)
+                        {
                             state.FrameServer.MediaPlayerRef = state.MediaPlayer;   // 重建后重新挂接 SETMUTE
+                            // 重建的 MediaPlayer 默认非静音: 补应用存储的静音意图
+                            // (修复重建后静音状态丢失的潜在问题, 2026-09-25)
+                            state.FrameServer.ApplyPendingMute();
+                        }
                         state.MediaPlayer.VideoFrameAvailable += (pl, o) => OnVideoFrameAvailable(pl, state);
                         state.MediaPlayer.PlaybackSession.NaturalVideoSizeChanged += (pl, e2) =>
                             Log("Size", new Exception($"conn#{state.Index} w={pl.NaturalVideoWidth} h={pl.NaturalVideoHeight}"));
@@ -413,12 +421,12 @@ namespace MiracastReceiverService
             }
         }
 
-        // 无帧超时阈值: 连续 5s 未收到任何视频帧 → 设备已断开(P2P/媒体层静默退出)。
-        // 2026-09-18 实测: Windows 笔记本源熄屏/静态画面/省电时暂停编码(帧率 60→0),
-        // 但 802.11 关联与 RTSP 会话仍在; 阈值过短(3s)会误杀暂停中的会话。
-        // 5s 为折中: 容忍短暂暂停, 真断开也能较快清理。
-        // 限帧场景(SETFPS 1)帧间隔 1s, 5s 阈值留有 4 帧余量, 不会误判。
-        private const int kIdleTimeoutMs = 5000;
+        // 无帧超时阈值: 连续 60s 未收到任何视频帧才拆除(兜底 Disconnected 事件丢失)。
+        // Windows 笔记本源画面完全静止时编码器合法停发帧(无内容变化不编码, 可静默数分钟),
+        // 短阈值(3s/5s/15s 实测)都会误杀静止投屏 → 画面被拆。
+        // 真断开由 session.Disconnected 事件触发即时清理(实测该事件偶发丢失, 见 02:51 连接
+        // 无 Disconnected 记录只有重连接管), 此阈值仅兜底事件丢失场景, 60s 残留可接受。
+        private const int kIdleTimeoutMs = 60000;
 
         private static void CheckIdleConnections(object _)
         {

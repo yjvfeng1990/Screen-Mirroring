@@ -554,6 +554,12 @@ void DesktopWindow::createMiracastPlaceholders()
             relayout();
             emit sourcesChanged();
         });
+        // 帧链路建立(服务端连入, 早于首帧/出声) → 早静音(2026-09-25):
+        // 此刻应用新连接默认值, SETMUTE 先于服务端 MediaPlayer 出声送达,
+        // 消除"新投的设备先出声再被静音"的窗口。
+        connect(view, &SessionView::sessionConnected, this, [this, view]() {
+            applyNewConnectionAudioDefault(view);
+        });
         // AirPlay 窗口嵌入成功 = 出画 → 重排/刷新列表(与首帧等价)
         connect(view, &SessionView::windowAttached, this, [this]() {
             relayout();
@@ -657,6 +663,11 @@ SessionView *DesktopWindow::addSession(const QString &name, mirror_backend_t bac
         applyNewConnectionAudioDefault(view);   // 第一路出声/后续路静音
         relayout();
         emit sourcesChanged();
+    });
+    // 帧链路建立(服务端连入, 早于首帧/出声) → 早静音(2026-09-25):
+    // 此刻应用新连接默认值, SETMUTE 先于服务端 MediaPlayer 出声送达。
+    connect(view, &SessionView::sessionConnected, this, [this, view]() {
+        applyNewConnectionAudioDefault(view);
     });
     // AirPlay 窗口嵌入成功 = 出画 → 重排/刷新列表(与首帧等价)
     connect(view, &SessionView::windowAttached, this, [this, view]() {
@@ -931,6 +942,10 @@ void DesktopWindow::onGatewayClientConnected(mirror_session_t *session, const QS
         QMutexLocker locker(&m_gatewayMutex);
         m_gatewayViews.insert(session, view);
     }
+    // 早静音(2026-09-25): 设备连入瞬间(视图创建即知)应用新连接音频默认值 ——
+    // 静音意图立刻记录并开始重试下发(WASAPI 会话激活即生效), 不再等到
+    // windowAttached/首帧才决策, 消除"新投的设备先出声再被静音"。
+    applyNewConnectionAudioDefault(view);
     relayout();
     emit statusMessage(isMice
                            ? QStringLiteral("Windows 设备 %1 已连入").arg(displayName)

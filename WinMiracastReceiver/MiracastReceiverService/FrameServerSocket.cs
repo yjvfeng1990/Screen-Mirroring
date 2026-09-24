@@ -108,6 +108,27 @@ namespace MiracastReceiverService
         // 用 WASAPI 按进程静音会把整组(含焦点路)都静音, 必须走 MediaPlayer.Volume。
         public MediaPlayer MediaPlayerRef { get; set; }
 
+        /// 本路目标静音状态(宿主 SETMUTE 的最新值)。
+        /// 早静音(2026-09-25): 帧通道建立早于 MediaPlayer 创建, 宿主在连接瞬间
+        /// 下发的 SETMUTE 可能先于 MediaPlayerRef 赋值到达 —— 先存储, MediaPlayer
+        /// 创建/重建时经 ApplyPendingMute 补应用, 保证首声前已按宿主意图静音。
+        public bool TargetMuted { get; private set; }
+
+        /// 把存储的静音意图应用到当前 MediaPlayer(MediaPlayer 创建/重建后调用)。
+        public void ApplyPendingMute()
+        {
+            if (MediaPlayerRef == null)
+                return;
+            try
+            {
+                // IsMuted 与 Volume 双保险(同 SETMUTE 处理)
+                MediaPlayerRef.IsMuted = TargetMuted;
+                MediaPlayerRef.Volume = TargetMuted ? 0.0 : 1.0;
+                Program.Log("Ctrl", new Exception($"ApplyPendingMute muted={TargetMuted} vol={MediaPlayerRef.Volume}"));
+            }
+            catch (Exception ex) { Program.Log("Ctrl", ex); }
+        }
+
         // 宿主 SETDISC 命令 → 请求断开该连接(由 Program 挂接 MiracastReceiverConnection)。
         public Action RequestDisconnect;
 
@@ -260,19 +281,28 @@ namespace MiracastReceiverService
                             {
                                 // 宿主全屏放大: 焦点路 SETMUTE 0(取消静音), 其余路 SETMUTE 1(静音)。
                                 // 按连接静音(MediaPlayer.Volume), 不能用 WASAPI 进程级(组内会误伤)。
-                                if (int.TryParse(line.Substring(8), out int m) && MediaPlayerRef != null)
+                                // 先存后发: MediaPlayerRef 未创建时也记录意图(ApplyPendingMute 补应用)。
+                                if (int.TryParse(line.Substring(8), out int m))
                                 {
-                                    try
+                                    TargetMuted = (m != 0);
+                                    if (MediaPlayerRef != null)
                                     {
-                                        // IsMuted 与 Volume 双保险: 实测部分机型仅设 Volume=0
-                                        // 后音频仍输出(渲染引擎未即时生效), IsMuted 是独立静音开关
-                                        MediaPlayerRef.IsMuted = (m != 0);
-                                        MediaPlayerRef.Volume = (m != 0) ? 0.0 : 1.0;
-                                        Program.Log("Ctrl", new Exception($"SETMUTE {m} vol={MediaPlayerRef.Volume} muted={MediaPlayerRef.IsMuted}"));
+                                        try
+                                        {
+                                            // IsMuted 与 Volume 双保险: 实测部分机型仅设 Volume=0
+                                            // 后音频仍输出(渲染引擎未即时生效), IsMuted 是独立静音开关
+                                            MediaPlayerRef.IsMuted = (m != 0);
+                                            MediaPlayerRef.Volume = (m != 0) ? 0.0 : 1.0;
+                                            Program.Log("Ctrl", new Exception($"SETMUTE {m} vol={MediaPlayerRef.Volume} muted={MediaPlayerRef.IsMuted}"));
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Program.Log("Ctrl", ex);
+                                        }
                                     }
-                                    catch (Exception ex)
+                                    else
                                     {
-                                        Program.Log("Ctrl", ex);
+                                        Program.Log("Ctrl", new Exception($"SETMUTE {m} (MediaPlayer 未就绪, 已存储待应用)"));
                                     }
                                 }
                             }

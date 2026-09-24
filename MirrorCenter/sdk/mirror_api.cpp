@@ -244,6 +244,12 @@ static void dispatchClientInfo(mirror_session_t *h, const QString &name, const Q
     h->cbs.on_client_info(h, nameUtf8.constData(), modelUtf8.constData(), h->userdata);
 }
 
+static void dispatchFrameLink(mirror_session_t *h)
+{
+    if (h && h->cbs.on_frame_link)
+        h->cbs.on_frame_link(h, h->userdata);
+}
+
 /* ============ 网关辅助 ============ */
 
 static mirror_session_t *findHandleForCore(MirrorSession *core)
@@ -553,6 +559,20 @@ MIRROR_API mirror_result_t mirror_init(void)
             if (h->core && h->core->id() == id) {
                 lock.unlock();
                 dispatchFrame(h);
+                lock.relock();
+                break;
+            }
+        }
+    }, Qt::QueuedConnection);
+
+    // 帧链路建立(服务端连入, 早于首帧): 宿主早静音决策点
+    QObject::connect(g_manager, &SessionManager::sessionFrameConnected,
+                     g_manager, [](const QString &id) {
+        QMutexLocker lock(&g_mutex);
+        for (auto *h : g_sessions.keys()) {
+            if (h->core && h->core->id() == id) {
+                lock.unlock();
+                dispatchFrameLink(h);
                 lock.relock();
                 break;
             }

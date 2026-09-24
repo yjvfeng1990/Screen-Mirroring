@@ -36,6 +36,8 @@ signals:
     void sessionStateChanged(const QString &id, mirror::SessionState state);
     void sessionWindowReady(const QString &id, qulonglong handle);
     void sessionFrameReady(const QString &id);
+    /// 帧链路已建立(服务端连入, 早于首帧/出声)—— 宿主早静音决策点
+    void sessionFrameConnected(const QString &id);
     void sessionLog(const QString &id, const QString &message);
     /// 投屏设备真实名称(服务端经帧通道上报)
     void sessionClientInfo(const QString &id, const QString &name, const QString &model);

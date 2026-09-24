@@ -312,11 +312,12 @@ void MirrorSession::onFrameIdleTimeout()
     // 仅出画中(WindowReady)才检测:等待态无帧属正常, 不误判
     if (m_state != SessionState::WindowReady)
         return;
-    // 与服务端 kIdleTimeoutMs(5s) 对齐: Windows 源熄屏/静态画面会暂停编码数秒,
-    // 阈值过短(3s)会"暂停一下就黑屏"。5s 内帧恢复则画面保持, 超时才回等待态。
-    if (!m_frameTimer.isValid() || m_frameTimer.elapsed() <= 5000)
+    // 与服务端 kIdleTimeoutMs(60s) 对齐: Windows 源画面完全静止时编码器合法停发帧
+    // (可静默数分钟), 短阈值(3s/5s/15s 实测)都会"静止一下就黑屏/断开"。
+    // 60s 内帧恢复则画面保持, 超时才回等待态(真断开由服务端关帧通道先行清画面)。
+    if (!m_frameTimer.isValid() || m_frameTimer.elapsed() <= 60000)
         return;
-    emit logMessage(m_id, QStringLiteral("frame idle 5s, treat as source disconnected"));
+    emit logMessage(m_id, QStringLiteral("frame idle 60s, treat as source disconnected"));
     // 帧通道未及时关闭(服务端 Disconnected 事件延迟)时主动回等待态 → UI 清画面。
     // 若随后服务端才关通道, onFrameClientDisconnected 会重复 setState(Starting),
     // 状态相同被去重, 无副作用; 若设备其实重连, 新帧到达后重新出画。
@@ -326,6 +327,7 @@ void MirrorSession::onFrameIdleTimeout()
 void MirrorSession::onFrameClientReady()
 {
     emit logMessage(m_id, QStringLiteral("frame link established"));
+    emit frameConnected(m_id);   // 早静音: 宿主在服务端 MediaPlayer 创建前下发默认静音
     // 注意:不再在此置 WindowReady —— 监听就绪(服务端连入)不等于投屏设备出画。
     // 状态由首帧(frameReady lambda)驱动, 否则从会话在"等待设备"阶段即被置为
     // WindowReady, 设备断开时 setState(Starting) 因状态相同被跳过 → UI 收不到
