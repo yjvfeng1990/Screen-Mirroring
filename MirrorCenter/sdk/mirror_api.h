@@ -274,6 +274,33 @@ typedef struct mirror_frame {
 MIRROR_API mirror_result_t mirror_get_frame(mirror_session_t *session,
                                             mirror_frame_t *frame);
 
+/*
+ * GPU 共享纹理帧描述(零拷贝模式, 2026-09-24)。接收服务经 --gpu 1 启用 GPU
+ * 链路后, 帧负载驻留其发布的命名共享纹理, 帧头经 TCP 送达:
+ *   纹理名  Local\MirrorCenterSharedTex_<port>_g<gen>_<slot>
+ *   格式    B8G8R8A8 (BGRA8), <width>×<height>
+ *   同步    服务端两槽轮换写, 无 GPU mutex; 宿主 GL 侧经
+ *           WGL_NV_DX_interop2 注册后 wglDXLockObjectsNV 采样。
+ * 宿主应在收到 on_frame 回调后优先调 mirror_get_gpu_frame: valid=1 时走
+ * GPU 渲染路径(setFrameGpu), 否则回退 mirror_get_frame(SHM)。
+ */
+typedef struct mirror_gpu_frame {
+    int valid;             /* 1 = GPU 帧模式已激活且有帧 */
+    int slot;              /* 共享纹理槽 0/1(本次帧) */
+    int gen;               /* 纹理环世代(尺寸变化/服务端重建时 +1, 需重开纹理) */
+    int width;
+    int height;
+    long long seq;         /* 帧序号(单调递增) */
+    unsigned short port;   /* 帧通道端口(纹理名 <port> 段) */
+} mirror_gpu_frame_t;
+
+/*
+ * 获取最新 GPU 帧信息(仅 Miracast GPU 零拷贝模式)。
+ * 返回 MIRROR_ERR_NOT_FOUND 表示 GPU 模式未激活(回退 SHM 路径)。
+ */
+MIRROR_API mirror_result_t mirror_get_gpu_frame(mirror_session_t *session,
+                                                mirror_gpu_frame_t *frame);
+
 /* 设置/更新会话回调。 */
 MIRROR_API mirror_result_t mirror_set_callbacks(mirror_session_t *session,
                                                 const mirror_callbacks_t *cbs,

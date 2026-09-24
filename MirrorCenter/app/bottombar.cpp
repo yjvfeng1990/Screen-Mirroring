@@ -46,6 +46,7 @@ void BottomControlBar::buildLayoutPill()
     const BtnDef defs[] = {
         { 1,  QStringLiteral("▢"), QStringLiteral("单屏")   },
         { 2,  QStringLiteral("◫"), QStringLiteral("双拼")   },
+        { 7,  QStringLiteral("▬"), QStringLiteral("横排")   },
         { 3,  QStringLiteral("▦"), QStringLiteral("三分屏") },
         { 4,  QStringLiteral("▤"), QStringLiteral("四宫格") },
         { 6,  QStringLiteral("▩"), QStringLiteral("六宫格") },

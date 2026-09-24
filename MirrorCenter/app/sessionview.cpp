@@ -12,6 +12,7 @@
 
 #include "sessionview.h"
 #include "audiocontrol.h"
+#include "d3dinterop.h"   // mirrorcore 库 include 路径(core/)
 
 #include <QLabel>
 #include <QToolButton>
@@ -30,6 +31,38 @@
 #include <QOpenGLShaderProgram>
 
 // ---- GLFrameSurface:GPU 纹理上传 + GPU 着色器缩放/裁切绘制 ----
+
+// 判断横屏帧左右边缘是否有足够宽的纯黑边(安卓竖屏投屏的特征)。
+// 只判断"有无黑边", 不做内容边界采样 → 内容深色不会被误判裁切。
+// 要求: 左右各至少 minBlack 列连续近黑(平均亮度<16), 双侧同时成立才视为竖屏内容。
+// SHM 路径逐帧检测; GPU 路径由 drawGpu 每 2s 读回一帧检测(结果缓存)。
+static bool hasSideBars(const QImage &img)
+{
+    const int w = img.width(), h = img.height();
+    if (w < 64 || h < 16 || img.format() != QImage::Format_RGB32)
+        return false;
+    const int rows[3] = { h * 3 / 8, h / 2, h * 5 / 8 };
+    const int minBlack = qMax(16, w / 12);   // 单侧黑边最小宽度(约帧宽 8%)
+    const int darkTh = 16;                    // 近黑亮度阈值
+    auto colDark = [&](int x) {
+        int sum = 0;
+        for (int i = 0; i < 3; ++i) {
+            const uchar *p = img.constScanLine(rows[i]) + x * 4;  // BGRA
+            sum += (p[2] + p[1] + p[0]) / 3;
+        }
+        return sum / 3 < darkTh;
+    };
+    int lb = 0;
+    for (int x = 0; x < w / 2; ++x) {
+        if (colDark(x)) ++lb; else break;
+    }
+    int rb = 0;
+    for (int x = w - 1; x > w / 2; --x) {
+        if (colDark(x)) ++rb; else break;
+    }
+    return lb >= minBlack && rb >= minBlack;
+}
+
 GLFrameSurface::GLFrameSurface(QWidget *parent)
     : QOpenGLWidget(parent)
 {
@@ -46,6 +79,12 @@ GLFrameSurface::~GLFrameSurface()
     makeCurrent();
     delete m_tex;
     m_tex = nullptr;
+    releaseGpuTextures();   // GPU 共享纹理注销(需上下文 current)
+    if (m_dx) {
+        m_dx->close();
+        delete m_dx;
+        m_dx = nullptr;
+    }
     doneCurrent();
 }
 
@@ -66,10 +105,26 @@ void GLFrameSurface::initializeGL()
         || !m_prog->addShaderFromSourceCode(QOpenGLShader::Fragment, fsrc)
         || !m_prog->link())
         qWarning() << "[GL] shader link failed:" << m_prog->log();
+
+    // GL 上下文可能重建(WinIdChange/样式切换): 旧 interop/纹理名全部失效,
+    // 清零状态由 paintGL 惰性重开(旧 wglDX 设备句柄无法在此释放, 容忍泄漏)。
+    if (m_dx) {
+        delete m_dx;   // 析构会告警未 close —— 旧上下文已死, 无法安全注销
+        m_dx = nullptr;
+    }
+    for (int i = 0; i < 2; ++i) {
+        m_gpuTex[i] = 0;
+        m_gpuObj[i] = nullptr;
+    }
+    m_gpuOpen = false;
+    m_gpuOpenFailed = false;
+    m_gpuBars = -1;
+    m_gpuBarsTimer.invalidate();
 }
 
 void GLFrameSurface::setFrame(const QImage &img, const QRectF &src, const QRectF &dst)
 {
+    m_gpuActive = false;   // SHM 帧到达:切回 QImage 路径(服务端回退/非 GPU 模式)
     m_src = src;
     m_dst = dst;
     if (img.isNull()) {
@@ -112,21 +167,177 @@ void GLFrameSurface::clearFrame()
         delete m_tex;
         m_tex = nullptr;
     }
+    m_gpuActive = false;
+    m_gpuPending = mirror_gpu_frame_t{};
+    releaseGpuTextures();   // 共享纹理随断连一并注销(服务端环已销毁)
     doneCurrent();
     m_src = m_dst = QRectF();
     update();
 }
 
-void GLFrameSurface::paintGL()
+void GLFrameSurface::setFrameGpu(const mirror_gpu_frame_t &g, const QRectF &src,
+                                 const QRectF &dst)
 {
-    auto *gl = QOpenGLContext::currentContext()
-                   ? QOpenGLContext::currentContext()->functions() : nullptr;
-    if (!gl)
-        return;
-    gl->glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    gl->glClear(GL_COLOR_BUFFER_BIT);
+    m_gpuPending = g;
+    m_gpuActive = g.valid != 0;
+    m_src = src;
+    m_dst = dst;
+    update();
+}
+
+void GLFrameSurface::releaseGpuTextures()
+{
+    if (m_dx) {
+        for (int i = 0; i < 2; ++i)
+            m_dx->releaseTexture(&m_gpuTex[i], &m_gpuObj[i]);
+    } else {
+        // 无 interop(上下文重建前收过 GPU 帧又没到 paint): 只清记录
+        for (int i = 0; i < 2; ++i) {
+            m_gpuTex[i] = 0;
+            m_gpuObj[i] = nullptr;
+        }
+    }
+    m_gpuOpen = false;
+    m_gpuOpenGen = 0;
+    m_gpuOpenPort = 0;
+    m_gpuOpenW = m_gpuOpenH = 0;
+    m_gpuOpenFailed = false;
+    // 检测结果随纹理环一并失效(断连/世代/尺寸变化后需重新检测)
+    m_gpuBars = -1;
+    m_gpuBarsTimer.invalidate();
+}
+
+/// 打开/重开 GPU 共享纹理(世代/端口/尺寸/上下文任一变化)。paintGL 内调用(上下文 current)。
+bool GLFrameSurface::ensureGpuTextures()
+{
+    const mirror_gpu_frame_t &g = m_gpuPending;
+    if (m_gpuOpen && m_gpuOpenGen == g.gen && m_gpuOpenPort == g.port
+        && m_gpuOpenW == g.width && m_gpuOpenH == g.height)
+        return true;   // 已就绪
+    releaseGpuTextures();
+
+    if (!m_dx)
+        m_dx = new mirror::D3DInterop();
+    if (!m_dx->open()) {
+        delete m_dx;
+        m_dx = nullptr;
+        if (!m_gpuOpenFailed) {
+            m_gpuOpenFailed = true;
+            qWarning() << "[GL] d3d interop open failed → GPU 帧无法渲染(等 SHM 回退)";
+        }
+        return false;
+    }
+    for (int i = 0; i < 2; ++i) {
+        wchar_t name[96];
+        swprintf_s(name, 96, L"Local\\MirrorCenterSharedTex_%u_g%d_%d",
+                   unsigned(g.port), g.gen, i);
+        int w = 0, h = 0;
+        void *obj = nullptr;
+        const GLuint t = m_dx->openSharedTexture(name, &w, &h, &obj);
+        if (!t) {
+            // 服务端环刚重建/还没建全: 下次 paint 重试(节流日志)
+            if (!m_gpuOpenFailed) {
+                m_gpuOpenFailed = true;
+                qWarning() << "[GL] open shared texture failed:" << name;
+            }
+            releaseGpuTextures();
+            return false;
+        }
+        m_gpuTex[i] = t;
+        m_gpuObj[i] = obj;
+    }
+    m_gpuOpen = true;
+    m_gpuOpenGen = g.gen;
+    m_gpuOpenPort = g.port;
+    m_gpuOpenW = g.width;
+    m_gpuOpenH = g.height;
+    m_gpuOpenFailed = false;
+    qInfo() << "[GL] GPU shared textures opened gen" << g.gen
+            << g.width << "x" << g.height;
+    return true;
+}
+
+/// 锁定共享纹理并采样绘制。锁失败(服务端正在写/纹理失效)返回 false → 保留上一帧。
+bool GLFrameSurface::drawGpu(QOpenGLFunctions *gl)
+{
+    if (!m_dst.isEmpty() && m_prog && m_prog->isLinked()
+        && ensureGpuTextures()) {
+        const int slot = (m_gpuPending.slot == 1) ? 1 : 0;
+        if (m_gpuObj[slot] && m_dx->blit(m_gpuObj[slot])
+            && m_dx->lock(m_gpuObj[slot])) {
+            // GPU 路径: v 公式与 drawQImage 完全一致(实测共享纹理行序与 QImage
+            // 上传约定相同, 均需 1- 翻转; 直接映射会上下颠倒)。
+            const int tw = m_gpuOpenW, th = m_gpuOpenH;
+            const float u0 = float(m_src.left()) / tw;
+            const float u1 = float(m_src.right() + 1.0) / tw;
+            const float vTop = 1.0f - float(m_src.top()) / th;              // 图像顶部 → v≈1
+            const float vBot = 1.0f - float(m_src.bottom() + 1.0) / th;     // 图像底部 → v≈0
+            const float w = float(width()), h = float(height());
+            const float x0 = float(m_dst.left()) / w * 2.0f - 1.0f;
+            const float x1 = float(m_dst.right() + 1.0) / w * 2.0f - 1.0f;
+            const float y0 = float(m_dst.bottom()) / h * 2.0f - 1.0f;
+            const float y1 = float(m_dst.top()) / h * 2.0f - 1.0f;
+            const float verts[4][4] = {
+                { x0, y0, u0, vBot },
+                { x1, y0, u1, vBot },
+                { x0, y1, u0, vTop },
+                { x1, y1, u1, vTop },
+            };
+            const float *vertsf = &verts[0][0];
+            m_prog->bind();
+            gl->glBindTexture(GL_TEXTURE_2D, m_gpuTex[slot]);
+            m_prog->setUniformValue("uTex", 0);
+            const int posLoc = m_prog->attributeLocation("aPos");
+            const int uvLoc  = m_prog->attributeLocation("aUV");
+            m_prog->enableAttributeArray(posLoc);
+            m_prog->setAttributeArray(posLoc, GL_FLOAT, vertsf, 2, int(sizeof(float) * 4));
+            m_prog->enableAttributeArray(uvLoc);
+            m_prog->setAttributeArray(uvLoc, GL_FLOAT, vertsf + 2, 2, int(sizeof(float) * 4));
+            gl->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            m_prog->disableAttributeArray(posLoc);
+            m_prog->disableAttributeArray(uvLoc);
+            m_prog->release();
+            m_dx->unlock(m_gpuObj[slot]);
+            // GPU 模式黑边检测(2 分屏铺满裁切用, M3): GPU 模式无逐帧 CPU 像素,
+            // 每 2s 读回一帧跑与 SHM 相同的 hasSideBars 判定(横屏帧内竖屏内容
+            // 特征)。读回 = staging Map(约 3.5MB PCIe 拷贝, 秒级一次开销可忽略),
+            // 结果缓存 m_gpuBars 供 SessionView::renderFrame 取中央 9:16 区域。
+            // 竖屏帧无需检测; 成败都重启计时(防读回失败时逐帧重试)。
+            // 内容旋转后最迟 2s 适应; 未检测(-1)时 renderFrame 按整帧处理。
+            const bool framePortrait = m_gpuOpenH > m_gpuOpenW;
+            if (!framePortrait
+                && (!m_gpuBarsTimer.isValid() || m_gpuBarsTimer.elapsed() > 2000)) {
+                m_gpuBarsTimer.restart();
+                QImage rd;
+                if (m_dx->readTexture(m_gpuObj[slot], rd) && !rd.isNull())
+                    m_gpuBars = hasSideBars(rd) ? 1 : 0;
+            }
+            static bool s_gpuDrawLogged = false;   // paintGL 单线程, 静态安全
+            if (!s_gpuDrawLogged) {
+                s_gpuDrawLogged = true;
+                qInfo() << "[GL] gpu frame drawn OK"
+                        << m_gpuOpenW << "x" << m_gpuOpenH << "slot" << slot;
+            }
+            return true;
+        }
+        // blit/锁失败: 保留上一帧内容(不清屏, 防闪烁), 下帧重试; 节流告警
+        {
+            static QElapsedTimer s_failT;
+            if (!s_failT.isValid() || s_failT.elapsed() > 5000) {
+                s_failT.restart();
+                qWarning() << "[GL] gpu blit/lock failed slot" << slot
+                           << "obj" << m_gpuObj[slot];
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+bool GLFrameSurface::drawQImage(QOpenGLFunctions *gl)
+{
     if (!m_tex || m_dst.isEmpty() || !m_prog || !m_prog->isLinked())
-        return;
+        return false;
     // GPU 缩放/裁切:纹理坐标取源区域, 顶点(NCD)取目标区域
     // 注意:QImage 上传后图像顶部对应纹理坐标 v=1(OpenGL 原点在左下), 需翻转 v
     const int tw = m_tex->width(), th = m_tex->height();
@@ -160,6 +371,26 @@ void GLFrameSurface::paintGL()
     m_prog->disableAttributeArray(posLoc);
     m_prog->disableAttributeArray(uvLoc);
     m_prog->release();
+    return true;
+}
+
+void GLFrameSurface::paintGL()
+{
+    auto *gl = QOpenGLContext::currentContext()
+                   ? QOpenGLContext::currentContext()->functions() : nullptr;
+    if (!gl)
+        return;
+    // GPU 帧优先(零拷贝采样); 无 GPU 帧走 QImage 上传路径。两条路径
+    // 锁失败/无内容时保留上一帧(不清屏), 只有完全无画面才清黑。
+    bool drew = false;
+    if (m_gpuActive && m_gpuPending.valid)
+        drew = drawGpu(gl);
+    else
+        drew = drawQImage(gl);
+    if (!drew) {
+        gl->glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        gl->glClear(GL_COLOR_BUFFER_BIT);
+    }
 }
 
 SessionView::SessionView(const QString &deviceName, mirror_backend_t backend,
@@ -447,6 +678,7 @@ void SessionView::resetToWaiting()
     if (m_videoLabel)
         m_videoLabel->clearFrame();
     m_hasFirstFrame = false;
+    m_muteApplied = false;   // 会话拆除:静音下发状态失效, 重连后经首帧重断言
     m_lastThumb = QPixmap();
 
     // 释放嵌入的视频窗口容器(AirPlay d3d11 / Miracast swap chain 窗口)。
@@ -696,59 +928,43 @@ void SessionView::setFillMode(bool on)
     m_fillMode = on;
 }
 
-// 判断横屏帧左右边缘是否有足够宽的纯黑边(安卓竖屏投屏的特征)。
-// 只判断"有无黑边", 不做内容边界采样 → 内容深色不会被误判裁切。
-// 要求: 左右各至少 minBlack 列连续近黑(平均亮度<16), 双侧同时成立才视为竖屏内容。
-static bool hasSideBars(const QImage &img)
-{
-    const int w = img.width(), h = img.height();
-    if (w < 64 || h < 16 || img.format() != QImage::Format_RGB32)
-        return false;
-    const int rows[3] = { h * 3 / 8, h / 2, h * 5 / 8 };
-    const int minBlack = qMax(16, w / 12);   // 单侧黑边最小宽度(约帧宽 8%)
-    const int darkTh = 16;                    // 近黑亮度阈值
-    auto colDark = [&](int x) {
-        int sum = 0;
-        for (int i = 0; i < 3; ++i) {
-            const uchar *p = img.constScanLine(rows[i]) + x * 4;  // BGRA
-            sum += (p[2] + p[1] + p[0]) / 3;
-        }
-        return sum / 3 < darkTh;
-    };
-    int lb = 0;
-    for (int x = 0; x < w / 2; ++x) {
-        if (colDark(x)) ++lb; else break;
-    }
-    int rb = 0;
-    for (int x = w - 1; x > w / 2; --x) {
-        if (colDark(x)) ++rb; else break;
-    }
-    return lb >= minBlack && rb >= minBlack;
-}
-
 void SessionView::renderFrame()
 {
     if (!m_sdkSession || !m_videoLabel)
         return;
-    mirror_frame_t frame;
-    if (mirror_get_frame(m_sdkSession, &frame) != MIRROR_OK) {
-        qWarning() << "[view] mirror_get_frame failed";
-        return;
-    }
 
-    // stride 与宽度对齐(RGB32 每行 4 字节)时零拷贝包装, 避免 8MB 逐行 memcpy;
-    // frame.data 在本次调用期间有效, setFrame 内同步上传为纹理, 输出安全。
+    // GPU 零拷贝帧优先:服务端 --gpu 1 且本进程支持 interop 时有效,
+    // 此时无 CPU 像素可读, 直接走共享纹理渲染路径。
+    mirror_gpu_frame_t gf{};
+    const bool gpuMode = mirror_get_gpu_frame(m_sdkSession, &gf) == MIRROR_OK && gf.valid;
+
     QImage img;
-    if (frame.stride == frame.width * 4) {
-        img = QImage(frame.data, frame.width, frame.height, frame.stride,
-                     QImage::Format_RGB32);
+    int fw = 0, fh = 0;
+    if (gpuMode) {
+        fw = gf.width;
+        fh = gf.height;
     } else {
-        img = QImage(frame.width, frame.height, QImage::Format_RGB32);
-        const int copyBytes = qMin(frame.stride, img.bytesPerLine());
-        for (int y = 0; y < frame.height; ++y) {
-            memcpy(img.scanLine(y),
-                   frame.data + static_cast<qint64>(y) * frame.stride,
-                   copyBytes);
+        mirror_frame_t frame;
+        if (mirror_get_frame(m_sdkSession, &frame) != MIRROR_OK) {
+            qWarning() << "[view] mirror_get_frame failed";
+            return;
+        }
+        fw = frame.width;
+        fh = frame.height;
+
+        // stride 与宽度对齐(RGB32 每行 4 字节)时零拷贝包装, 避免 8MB 逐行 memcpy;
+        // frame.data 在本次调用期间有效, setFrame 内同步上传为纹理, 输出安全。
+        if (frame.stride == frame.width * 4) {
+            img = QImage(frame.data, frame.width, frame.height, frame.stride,
+                         QImage::Format_RGB32);
+        } else {
+            img = QImage(frame.width, frame.height, QImage::Format_RGB32);
+            const int copyBytes = qMin(frame.stride, img.bytesPerLine());
+            for (int y = 0; y < frame.height; ++y) {
+                memcpy(img.scanLine(y),
+                       frame.data + static_cast<qint64>(y) * frame.stride,
+                       copyBytes);
+            }
         }
     }
     // ---- 布局计算:缩放/裁切/留边全部由 GPU 完成, CPU 仅算矩形 ----
@@ -756,15 +972,19 @@ void SessionView::renderFrame()
     // 其它分屏(1 屏/3 屏以上)一律保持原比例。只看视频方向, 与格子方向无关。
     // 铺满采用"高度优先":高度 100% 显示(内容不裁切), 宽度超出才裁左右,
     // 不足则居中留深色边 —— 避免竖屏视频上下被裁掉一截。
-    const bool framePortrait = frame.height > frame.width;
+    const bool framePortrait = fh > fw;
     // 横屏帧:2 分屏下先判断帧左右边缘是否有足够宽的纯黑边(竖屏内容特征)。
     // 有黑边 → 取帧中央固定 9:16 区域(不做内容边界采样, 深色内容不会被误裁);
     // 无黑边(真横屏内容) → 整帧原样显示, 不做任何裁切。
-    QRect barRect(0, 0, frame.width, frame.height);
-    if (m_fillMode && !framePortrait && hasSideBars(img)) {
-        const int ch = frame.height;
-        const int cw = qMin(ch * 9 / 16, frame.width);
-        barRect = QRect((frame.width - cw) / 2, 0, cw, ch);
+    // GPU 模式无逐帧 CPU 像素: 检测由 drawGpu 每 2s 读回一帧完成,
+    // 此处用缓存结果(未检测到首结果前按整帧处理)。
+    QRect barRect(0, 0, fw, fh);
+    const bool sideBars = gpuMode ? m_videoLabel->gpuHasSideBars()
+                                  : hasSideBars(img);
+    if (m_fillMode && !framePortrait && sideBars) {
+        const int ch = fh;
+        const int cw = qMin(ch * 9 / 16, fw);
+        barRect = QRect((fw - cw) / 2, 0, cw, ch);
     }
     // 内容为竖屏(帧本身竖屏, 或横屏帧内取出的内容区竖屏)才铺满
     const bool contentPortrait = framePortrait || barRect.width() < barRect.height();
@@ -792,17 +1012,21 @@ void SessionView::renderFrame()
         // 等比留边:完整可见, 居中
         const double s = qMin(target.width() / src.width(),
                               target.height() / src.height());
-        const double fw = src.width() * s, fh = src.height() * s;
-        dst = QRectF((target.width() - fw) / 2.0,
-                     (target.height() - fh) / 2.0, fw, fh);
+        const double dw = src.width() * s, dh = src.height() * s;
+        dst = QRectF((target.width() - dw) / 2.0,
+                     (target.height() - dh) / 2.0, dw, dh);
     }
-    m_videoLabel->setFrame(img, src, dst);
+    if (gpuMode)
+        m_videoLabel->setFrameGpu(gf, src, dst);
+    else
+        m_videoLabel->setFrame(img, src, dst);
     // 分辨率只在速率栏显示(↓↑ Mbps · fps · WxH), 状态文字不重复带
     setStatus(QStringLiteral("接收中"));
 
     // 首帧:占位会话真正出画, 通知主窗口/列表开始显示
     if (!m_hasFirstFrame) {
         m_hasFirstFrame = true;
+        setMuted(m_muted);   // 重断言静音(Miracast SETMUTE 需连接建立后才生效)
         emit firstFrameReceived();
         updateInfoBadge();   // 有内容了:悬浮窗随之显示并贴紧视图
         setBadgeCollapsed(false);   // 投屏出画: 信息栏完整显示
@@ -811,9 +1035,9 @@ void SessionView::renderFrame()
 
     // 帧率/分辨率统计(1s 窗口):分辨率变化时更新标签, 帧率每秒更新
     ++m_rateFrames;
-    if (m_lastW != frame.width || m_lastH != frame.height) {
-        m_lastW = frame.width;
-        m_lastH = frame.height;
+    if (m_lastW != fw || m_lastH != fh) {
+        m_lastW = fw;
+        m_lastH = fh;
         if (m_resLabel)
             m_resLabel->setText(QStringLiteral("%1×%2").arg(m_lastW).arg(m_lastH));
     }
@@ -827,7 +1051,7 @@ void SessionView::renderFrame()
             m_fpsLabel->setText(QStringLiteral("%1fps").arg(m_lastFps));
         // 显示帧率打点(供日志核对解码/渲染是否吃得住)
         qInfo() << "[fps]" << m_lastFps << "fps"
-                << frame.width << "x" << frame.height;
+                << fw << "x" << fh;
     }
     // 无线链路速率:首次收到帧后启动周期查询
     if (!m_netTimer.isActive())
@@ -1021,6 +1245,7 @@ void SessionView::attachWindow(qulonglong wid)
     }
 
     setStatus(QStringLiteral("已连接"));
+    setMuted(m_muted);   // 重断言静音(新嵌入的 uxplay/d3d11 进程默认非静音)
     // 窗口嵌入成功 = AirPlay 出画:通知主窗口重排(否则视图一直隐藏,
     // 主窗口停留在空状态提示 —— 2026-08-16 实测"AirPlay 有声音但主窗口显示投屏接收中心")。
     emit windowAttached();
@@ -1130,17 +1355,8 @@ void SessionView::hideEvent(QHideEvent *e)
 
 void SessionView::toggleMute()
 {
-    if (!m_sdkSession)
-        return;
-    m_muted = !m_muted;
-    if (!applyMute(m_muted)) {
-        m_muted = !m_muted;   // 静音控制失败, 回滚
-        setStatus(QStringLiteral("静音控制失败"));
-        return;
-    }
-    if (m_muteBtn)
-        m_muteBtn->setText(m_muted ? QStringLiteral("🔇") : QStringLiteral("🔊"));
-    setStatus(m_muted ? QStringLiteral("已静音") : QStringLiteral("已取消静音"));
+    setMuted(!m_muted);   // 记录意图并尝试下发(失败自动重试)
+    emit audioToggled();  // 意图先行: 主窗口立即更新音频焦点选举, 本路失败经重试补下发
     restartBadgeCollapseTimer();   // 按钮操作 = 有操作, 重置自动收起计时
 }
 
@@ -1160,17 +1376,49 @@ bool SessionView::applyMute(bool mute)
         setStatus(QStringLiteral("后端未就绪"));
         return false;
     }
+    // 空闲实例(设备未连入, 窗口未嵌入)没有音频流可静: 视为已应用,
+    // 避免对预置实例空报"未找到音频会话"; 设备连入时 attachWindow 重断言。
+    if (!m_childWindow)
+        return true;
     return mirrorui::setProcessAudioMute(pid, mute);
 }
 
 void SessionView::setMuted(bool mute)
 {
-    if (!m_sdkSession)
-        return;
+    // 无论后端是否就绪都记录意图: 就绪前(如 Miracast 占位未收到首帧)先记下,
+    // 首帧/窗口嵌入时经重断言补下发。
     m_muted = mute;
-    applyMute(mute);
     if (m_muteBtn)
         m_muteBtn->setText(mute ? QStringLiteral("🔇") : QStringLiteral("🔊"));
+    if (m_muteApplied == mute)
+        return;   // 已处于目标状态, 不重复下发
+    if (!applyMute(mute)) {
+        scheduleMuteRetry();   // 音频会话未激活等: 延迟重试
+        return;
+    }
+    m_muteApplied = mute;
+}
+
+// 静音下发重试: WASAPI 音频会话在设备连入/音频流激活后才出现在枚举列表,
+// 过早下发会"未找到"。失败后周期重试; 回到等待态(设备断开)则停止,
+// 由 attachWindow/首帧重断言接力。
+void SessionView::scheduleMuteRetry()
+{
+    if (m_muteRetryPending)
+        return;
+    m_muteRetryPending = true;
+    QTimer::singleShot(2000, this, [this]() {
+        m_muteRetryPending = false;
+        if (m_muteApplied == m_muted)
+            return;   // 已同步(重断言路径可能已处理)
+        if (!m_running || (!m_childWindow && !m_hasFirstFrame))
+            return;   // 会话结束/回等待态: 停止重试
+        if (!applyMute(m_muted)) {
+            scheduleMuteRetry();
+            return;
+        }
+        m_muteApplied = m_muted;
+    });
 }
 
 void SessionView::toggleFullscreen()

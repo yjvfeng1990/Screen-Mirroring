@@ -13,6 +13,12 @@ class QLabel;
 class QWindow;
 class QOpenGLTexture;
 class QOpenGLShaderProgram;
+class QOpenGLFunctions;
+
+// 引入 SDK C 接口(GLFrameSurface 的 setFrameGpu 用 mirror_gpu_frame_t)
+#include "mirror_api.h"
+
+namespace mirror { class D3DInterop; }
 
 /**
  * 帧显示控件:QOpenGLWidget + GPU 纹理缩放。
@@ -20,6 +26,10 @@ class QOpenGLShaderProgram;
  * + 软件合成(CPU) 全部改由 GPU 完成:帧零拷贝包装后 setFrame 上传为纹理,
  * paintGL 中 QPainter::drawTexture 用 GPU 完成缩放/裁切/留边, CPU 仅算矩形。
  * 每会话独立 GL 控件/纹理(多路分屏互不影响)。
+ *
+ * GPU 零拷贝路径(M2, 2026-09-24): setFrameGpu 提供共享纹理描述后,
+ * paintGL 经 WGL_NV_DX_interop2 直接采样服务端共享纹理(像素不过 CPU);
+ * interop 不可用/未启用时自动走 QImage 上传路径(完整保留)。
  */
 class GLFrameSurface : public QOpenGLWidget
 {
@@ -31,7 +41,13 @@ public:
     /** 上传帧并标记重绘:src 为源图像像素区域(黑边裁切), dst 为目标区域(高度优先/等比留边)。
      *  上传同步完成, 调用后 img 可安全释放(SDK 帧 buffer 无需持有)。 */
     void setFrame(const QImage &img, const QRectF &src, const QRectF &dst);
+    /** GPU 零拷贝帧:记录共享纹理描述, paintGL 中锁纹理直接采样(无 CPU 像素)。
+     *  g.valid 必须为 1;纹理名按 mirror_gpu_frame 的 port/gen/slot 规约拼接。 */
+    void setFrameGpu(const mirror_gpu_frame_t &g, const QRectF &src, const QRectF &dst);
     void clearFrame();
+    /** GPU 模式黑边检测缓存结果(M3): true = 最近一次读回检测判定为
+     *  "横屏帧内竖屏内容+左右黑边"(2 分屏铺满裁切用); 未检测前 false。 */
+    bool gpuHasSideBars() const { return m_gpuBars == 1; }
 
 protected:
     void initializeGL() override;
@@ -42,10 +58,28 @@ private:
     QRectF m_dst;                 // 目标绘制区域(控件坐标)
     QOpenGLTexture *m_tex = nullptr;
     QOpenGLShaderProgram *m_prog = nullptr;
-};
 
-// 引入 SDK C 接口
-#include "mirror_api.h"
+    // ---- GPU 共享纹理渲染状态(仅在 GUI 线程访问; GL 调用在 paintGL 内) ----
+    bool ensureGpuTextures();     // 上下文/世代/尺寸变化时重开 interop + 注册纹理
+    bool drawGpu(QOpenGLFunctions *gl);     // 锁定共享纹理采样绘制(成功 true)
+    bool drawQImage(QOpenGLFunctions *gl);  // 原 QImage 上传路径绘制
+    void releaseGpuTextures();    // 注销全部 GPU 纹理(interop 打开状态下调用)
+
+    mirror_gpu_frame_t m_gpuPending{};   // 最新 GPU 帧描述(待 paintGL 消费)
+    bool m_gpuActive = false;            // 当前按 GPU 帧渲染(SHM 回退时置 false)
+    mirror::D3DInterop *m_dx = nullptr;  // interop 封装(惰性创建)
+    GLuint m_gpuTex[2] = {};             // 已注册 GL 纹理名(每槽一个)
+    void *m_gpuObj[2] = {};              // interop 对象句柄(lock/unlock 用)
+    bool m_gpuOpen = false;              // 已按 (gen,port,size) 打开
+    int m_gpuOpenGen = 0;
+    unsigned m_gpuOpenPort = 0;
+    int m_gpuOpenW = 0, m_gpuOpenH = 0;
+    bool m_gpuOpenFailed = false;        // 打开失败节流日志
+    // GPU 模式黑边检测(drawGpu 每 2s 读回一帧, 见 hasSideBars):
+    // -1 未检测(按整帧处理), 0 无黑边, 1 有黑边(竖屏内容)
+    int m_gpuBars = -1;
+    QElapsedTimer m_gpuBarsTimer;        // 上次检测节流
+};
 
 /**
  * 单个投屏会话视图(SDK 演示宿主)。
@@ -117,6 +151,8 @@ signals:
     void firstFrameCleared();
     /** 设备真实名称已上报(服务端经帧通道 MCCTRL1 NAME: 送达) */
     void clientNameChanged(const QString &name);
+    /** 用户手动切换了音频开关(DesktopWindow 据此更新音频焦点路选举) */
+    void audioToggled();
 
 protected:
     void moveEvent(QMoveEvent *e) override;
@@ -133,6 +169,8 @@ private:
     /** 把本视图回调挂到 SDK 会话上 */
     void attachCallbacks();
     void attachWindow(qulonglong wid);
+    /** 静音下发失败后的周期重试(音频会话激活延迟兜底) */
+    void scheduleMuteRetry();
     void setStatus(const QString &s);
     void renderFrame();
     /** 周期查询 Wifi 网卡性能计数器, 差分显示源网络实时接收/发送速率 */
@@ -185,6 +223,8 @@ private:
     class QToolButton *m_muteBtn = nullptr; // 静音切换
     class QToolButton *m_fullBtn = nullptr; // 全屏切换
     bool m_muted            = false;
+    bool m_muteApplied      = false;     // m_muted 是否已成功下发到后端/进程
+    bool m_muteRetryPending = false;     // 静音下发重试定时器在途
     bool m_running          = false;
     QTimer m_thumbTimer;                 // 缩略图抓取节拍(内容变化时 1.2s, 静止时 3s)
     QPixmap m_lastThumb;                 // 最近一帧缩略图

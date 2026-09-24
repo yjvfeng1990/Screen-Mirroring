@@ -29,6 +29,7 @@ target_include_directories(MirrorCenter PRIVATE
 
 target_link_libraries(MirrorCenter PRIVATE
     mirrorsdk
+    mirrorcore   # GPU 零拷贝: GLFrameSurface 直接使用 core/D3DInterop(wgl interop 需与宿主 GL 上下文同进程)
     Qt6::Widgets
     Qt6::Network
     Qt6::OpenGLWidgets

@@ -280,6 +280,7 @@ void DesktopWindow::relayout()
         case 0:
             if (n == 1)      { cols = 1; rows = 1; }
             else if (n == 2) { cols = 2; rows = 1; }
+            else if (n == 3) { cols = 3; rows = 1; }   // 3 路一行三屏(取消上2下1的四宫格)
             else if (n <= 4) { cols = 2; rows = 2; }
             else if (n <= 6) { cols = 3; rows = 2; }
             else if (n <= 9) { cols = 3; rows = 3; }
@@ -291,6 +292,10 @@ void DesktopWindow::relayout()
         case 3: cols = 3; rows = (n + 2) / 3; break;
         case 4: cols = 2; rows = 2; break;
         case 6: cols = 3; rows = (n + 1) / 2; break;
+        case 7:   // 横排: 2路左右/3路左中右; 4路起回退四宫格(上二下二)
+            if (n <= 3) { cols = n; rows = 1; }
+            else        { cols = 2; rows = (n + 1) / 2; }
+            break;
         default: break;
     }
     cols = qMin(cols, n);
@@ -308,15 +313,15 @@ void DesktopWindow::relayout()
         shown.append(view);
     }
 
-    // 仅在 2 分屏时启用铺满:竖屏视频 cover 填满竖格(无黑边);
-    // 单路/3 路及以上全部保持原比例(完整可见)。
+    // 仅在 2/3 分屏时启用铺满:竖屏视频 cover 填满竖格(无黑边, 2 路左右 /
+    // 3 路一行三屏的格子都是竖格);单路/4 路及以上保持原比例(完整可见)。
     for (SessionView *view : shown)
-        view->setFillMode(shown.size() == 2);
+        view->setFillMode(shown.size() == 2 || shown.size() == 3);
 
-    // AirPlay(uxplay)侧同步:2 分屏时写 "1"(uxplay 对竖屏视频动态裁切铺满),
+    // AirPlay(uxplay)侧同步:2/3 分屏时写 "1"(uxplay 对竖屏视频动态裁切铺满),
     // 其余写 "0"。只有值变化才写, 避免高频 relayout 反复落盘。
     static bool lastFill = false;
-    const bool wantFill = (active.size() == 2);
+    const bool wantFill = (active.size() == 2 || active.size() == 3);
     if (wantFill != lastFill) {
         lastFill = wantFill;
         QFile f(QString::fromUtf8(mirror_airplay_fill_file()));
@@ -404,11 +409,51 @@ void DesktopWindow::relayout()
     }
     emit statusMessage(QStringLiteral("会话数: %1  ·  布局: %2 路%3")
                            .arg(active.size())
-                           .arg(m_layoutMode ? m_layoutMode : qMax(1, cols))
+                           .arg(m_layoutMode == 7 ? qMax(1, cols)
+                                : m_layoutMode ? m_layoutMode : qMax(1, cols))
                            .arg(shown.size() < active.size()
                                     ? QStringLiteral("  ·  超出解码上限, 仅显示 %1 路").arg(shown.size())
                                     : QString()));
     emit sessionCountChanged(active.size());
+}
+
+// 统一音频策略(2026-09-25 重构):
+//  - 全屏焦点: 强制焦点路出声, 其余静音(需求: 全屏自动打开该路音频)
+//  - 无全屏: 不动任何路的静音状态 —— 尊重手动操作, 允许全部静音。
+//    (旧实现无条件选 winner 强制出声, 导致"手动静音最后一出声路"被立即撤销:
+//    先静 Miracast 再静 AirPlay 时 Miracast 被自动重新打开)
+//  互斥(手动开启某路→其它路静音)由 audioToggled 处理;
+//  新连接默认值(第一路出声/后续路静音)由 applyNewConnectionAudioDefault 处理;
+//  全屏前的音频状态快照在 onViewFullscreen 中保存/恢复。
+void DesktopWindow::applyAudioPolicy()
+{
+    if (m_focusView && m_focusView->isActive()) {
+        SessionView *focus = m_focusView;
+        for (SessionView *v : m_views)
+            if (v)
+                v->setMuted(v != focus);
+    }
+}
+
+// 新连接出画默认值: 已有其它活跃会话 → 本路默认静音(保留当前出声路);
+// 本路是第一路活跃会话 → 默认出声(单路投屏默认有声音)。
+// 全屏期间接入的新路: 静音(焦点路保留出声)。
+void DesktopWindow::applyNewConnectionAudioDefault(SessionView *view)
+{
+    if (!view)
+        return;
+    if (m_focusView && m_focusView->isActive() && m_focusView != view) {
+        view->setMuted(true);
+        return;
+    }
+    bool otherActive = false;
+    for (SessionView *v : m_views) {
+        if (v && v != view && v->isActive()) {
+            otherActive = true;
+            break;
+        }
+    }
+    view->setMuted(otherActive);
 }
 
 void DesktopWindow::onViewFullscreen(const QString &sessionId)
@@ -425,7 +470,19 @@ void DesktopWindow::onViewFullscreen(const QString &sessionId)
         m_focusView = nullptr;
         if (target)
             target->setFullscreenActive(false);
+        // 恢复进入全屏前各路音频状态(含"全部静音"状态), 然后清空快照
+        for (auto it = m_preFullscreenMuted.constBegin();
+             it != m_preFullscreenMuted.constEnd(); ++it)
+            it.key()->setMuted(it.value());
+        m_preFullscreenMuted.clear();
     } else {
+        // 首次进入全屏: 快照各活跃路的静音状态(全屏间切换焦点路不重复快照,
+        // 还原时回到最初状态)
+        if (m_preFullscreenMuted.isEmpty()) {
+            for (SessionView *v : m_views)
+                if (v && v->isActive())
+                    m_preFullscreenMuted.insert(v, v->isMuted());
+        }
         m_focusView = target;
         target->setFullscreenActive(true);
     }
@@ -441,10 +498,9 @@ void DesktopWindow::onViewFullscreen(const QString &sessionId)
         mirror_set_frame_fps(s, (m_focusView && m_focusView != v) ? 1 : 0);
     }
 
-    // 全屏联动静音: 焦点路出声, 其余被遮住的路静音(避免多路音频混杂);
-    // 还原后全部恢复出声。Miracast 按连接 SETMUTE, AirPlay/MICE 按进程 PID。
-    for (SessionView *v : m_views)
-        v->setMuted(m_focusView != nullptr && m_focusView != v);
+    // 全屏联动音频: 焦点路强制出声其余静音; 还原时快照已恢复, 此处(无全屏)不再干预。
+    // Miracast 按连接 SETMUTE, AirPlay/MICE 按进程 PID。
+    applyAudioPolicy();
 
     relayout();
 }
@@ -493,7 +549,8 @@ void DesktopWindow::createMiracastPlaceholders()
         connect(view, &SessionView::fullscreenRequested,
                 this, &DesktopWindow::onViewFullscreen);
         // 首帧前保持隐藏(Miracast 占位会话);收到首帧才在主窗口/列表出现
-        connect(view, &SessionView::firstFrameReceived, this, [this]() {
+        connect(view, &SessionView::firstFrameReceived, this, [this, view]() {
+            applyNewConnectionAudioDefault(view);   // 第一路出声/后续路静音
             relayout();
             emit sourcesChanged();
         });
@@ -502,12 +559,23 @@ void DesktopWindow::createMiracastPlaceholders()
             relayout();
             emit sourcesChanged();
         });
+        // 用户手动切换音频: 互斥只在"手动开启"时生效(开声 → 其它活跃路静音);
+        // 手动静音 → 不自动开其它路。与 addSession/onGatewayClientConnected 一致。
+        // (占位视图此前缺失本连接 → 2 路 Miracast 互斥不生效, 2026-09-25)
+        connect(view, &SessionView::audioToggled, this, [this, view]() {
+            if (!view->isMuted()) {
+                for (SessionView *v : m_views)
+                    if (v && v != view && v->isActive())
+                        v->setMuted(true);
+            }
+        });
         // 设备名就绪(服务端上报真实名) → 刷新控制面板列表
         connect(view, &SessionView::clientNameChanged, this, [this]() {
             emit sourcesChanged();
         });
         // 帧链路断开(设备退出):画面清空回到等待 → 重排/刷新列表
         connect(view, &SessionView::firstFrameCleared, this, [this]() {
+            applyAudioPolicy();   // 出声路断开 → 重选举, 静音路保持静音
             relayout();
             emit sourcesChanged();
         });
@@ -585,18 +653,29 @@ SessionView *DesktopWindow::addSession(const QString &name, mirror_backend_t bac
     connect(view, &SessionView::fullscreenRequested,
             this, &DesktopWindow::onViewFullscreen);
     // 首帧前保持隐藏(Miracast 占位会话);收到首帧才在主窗口/列表出现
-    connect(view, &SessionView::firstFrameReceived, this, [this]() {
+    connect(view, &SessionView::firstFrameReceived, this, [this, view]() {
+        applyNewConnectionAudioDefault(view);   // 第一路出声/后续路静音
         relayout();
         emit sourcesChanged();
     });
     // AirPlay 窗口嵌入成功 = 出画 → 重排/刷新列表(与首帧等价)
-    connect(view, &SessionView::windowAttached, this, [this]() {
+    connect(view, &SessionView::windowAttached, this, [this, view]() {
+        applyNewConnectionAudioDefault(view);
         relayout();
         emit sourcesChanged();
     });
     // 设备名就绪(服务端上报真实名) → 刷新控制面板列表
     connect(view, &SessionView::clientNameChanged, this, [this]() {
         emit sourcesChanged();
+    });
+    // 用户手动切换音频: 互斥只在"手动开启"时生效(开声 → 其它活跃路静音);
+    // 手动静音 → 不自动开其它路(允许全部静音, 尊重手动操作)
+    connect(view, &SessionView::audioToggled, this, [this, view]() {
+        if (!view->isMuted()) {
+            for (SessionView *v : m_views)
+                if (v && v != view && v->isActive())
+                    v->setMuted(true);
+        }
     });
     m_views.append(view);
     relayout();
@@ -686,14 +765,13 @@ void DesktopWindow::removeSession(const QString &sessionId)
     // 绝不能走 onSessionClosed 的整组关闭: 它会销毁主会话句柄 → core->stop()
     // 杀掉共享服务进程, 其余在投连接随进程一起消失(2026-08-15 崩溃根因)。
     if (target->backend() == MIRROR_BACKEND_MIRACAST) {
-        // 焦点路被移除: 先退出独占全屏, 恢复其余被静音/限帧的路
+        // 焦点路被移除: 先退出独占全屏, 恢复其余被遮路的帧率
         if (m_focusView == target) {
             target->setFullscreenActive(false);
             m_focusView = nullptr;
             for (SessionView *v : m_views) {
                 if (v == target)
                     continue;
-                v->setMuted(false);
                 if (mirror_session_t *s = v->sdkSession())
                     mirror_set_frame_fps(s, 0);
             }
@@ -703,6 +781,8 @@ void DesktopWindow::removeSession(const QString &sessionId)
         // 立即清空目标视图画面回占位等待(不依赖服务端断链回调时序:
         // SETDISC → 服务端断开连接 → 帧通道关闭, 该回调才触发, 存在时延/状态拦截)
         target->resetToWaiting();
+        // 音频: 无全屏不动任何路(保持移除前状态); 全屏焦点路被移除时重选举
+        applyAudioPolicy();
         return;
     }
 
@@ -830,9 +910,19 @@ void DesktopWindow::onGatewayClientConnected(mirror_session_t *session, const QS
         emit sourcesChanged();
     });
     // 嵌入窗口就绪 = 出画 → 重排/刷新列表(网关会话可能在视图创建后才连入)
-    connect(view, &SessionView::windowAttached, this, [this]() {
+    connect(view, &SessionView::windowAttached, this, [this, view]() {
+        applyNewConnectionAudioDefault(view);   // 第一路出声/后续路静音
         relayout();
         emit sourcesChanged();
+    });
+    // 用户手动切换音频: 互斥只在"手动开启"时生效(开声 → 其它活跃路静音);
+    // 手动静音 → 不自动开其它路(允许全部静音, 尊重手动操作)
+    connect(view, &SessionView::audioToggled, this, [this, view]() {
+        if (!view->isMuted()) {
+            for (SessionView *v : m_views)
+                if (v && v != view && v->isActive())
+                    v->setMuted(true);
+        }
     });
 
     view->adoptGatewaySession(session, displayName);
@@ -895,15 +985,16 @@ void DesktopWindow::onSessionClosed(const QString &sessionId)
             m_focusView = nullptr;
     }
 
-    // 焦点路被移除(全屏放大被关闭): 其余被静音的路恢复出声, 帧率恢复默认
+    // 焦点路被移除(全屏放大被关闭): 帧率恢复默认; 音频仅在全屏策略内重选举,
+    // 无全屏 → 不动任何路(保持断开前状态, 修复断开后静音路被误开的 BUG)
     if (!m_focusView) {
         for (SessionView *v : m_views) {
-            v->setMuted(false);
             mirror_session_t *s = v->sdkSession();
             if (s)
                 mirror_set_frame_fps(s, 0);
         }
     }
+    applyAudioPolicy();
 
     // 已无 Miracast 视图 → 允许重新启动整组
     bool hasMira = false;

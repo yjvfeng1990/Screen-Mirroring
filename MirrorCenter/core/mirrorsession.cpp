@@ -84,6 +84,11 @@ QImage MirrorSession::latestFrame() const
     return m_frameClient ? m_frameClient->latestFrame() : QImage();
 }
 
+FrameClient::GpuFrameInfo MirrorSession::latestGpuFrame() const
+{
+    return m_frameClient ? m_frameClient->latestGpuFrame() : FrameClient::GpuFrameInfo();
+}
+
 QSize MirrorSession::videoSize() const
 {
     return m_frameClient ? m_frameClient->videoSize() : QSize();

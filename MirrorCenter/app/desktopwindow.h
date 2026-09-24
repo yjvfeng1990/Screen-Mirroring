@@ -102,6 +102,11 @@ private:
     void buildUi();
     void relayout();
     void updateEmptyState();
+    /** 统一音频策略: 全屏焦点路强制出声, 其余静音; 无全屏时不动任何路
+     *  (尊重手动操作, 允许全部静音)。互斥与新连接默认值走专用函数。 */
+    void applyAudioPolicy();
+    /** 新连接出画默认值: 已有其它活跃会话 → 本路默认静音; 第一路 → 默认出声 */
+    void applyNewConnectionAudioDefault(SessionView *view);
     /** 视图点击全屏/还原 → 切换该会话独占全屏 */
     void onViewFullscreen(const QString &sessionId);
     /** 右缘触发条重定位(独立顶层窗: 屏幕全局坐标 + 显示控制) */
@@ -141,7 +146,8 @@ protected:
     bool            m_sideTriggerEnabled = true; // 控制面板展开时禁用(避免浮在面板上)
     QList<SessionView *> m_views;
     SessionView *m_focusView = nullptr;   // 独占全屏的会话视图(非空时只显示它)
-    int  m_layoutMode = 0;   // 0=按会话数自动(1全屏/2左右/3+四宫格), 1/2/3/4/6=手动覆盖
+    QHash<SessionView *, bool> m_preFullscreenMuted;   // 进入全屏前各活跃路的静音状态快照
+    int  m_layoutMode = 0;   // 0=按会话数自动(1全屏/2左右/3+四宫格), 1/2/3/4/6=手动覆盖, 7=横排(2路左右/3路左中右/4+路四宫格)
     bool m_gatewayStarted  = false;   // AirPlay 网关已启动(幂等)
     bool m_miracastStarted = false;
     bool m_miceStarted     = false;   // MS-MICE 接收端已启动(幂等)

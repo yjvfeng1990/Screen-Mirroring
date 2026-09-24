@@ -6,6 +6,8 @@ add_library(mirrorcore STATIC
     sessionmanager.h
     frameclient.cpp
     frameclient.h
+    d3dinterop.cpp
+    d3dinterop.h
     airplaygateway.cpp
     airplaygateway.h
     mdnsbroadcast.cpp
@@ -33,4 +35,8 @@ if(WIN32)
     target_compile_definitions(mirrorcore PRIVATE _CRT_SECURE_NO_WARNINGS)
     # MS-MICE 解码: Windows Media Foundation(MFT)
     target_link_libraries(mirrorcore PUBLIC mfplat mfuuid)
+    # GPU 零拷贝: D3D11 共享纹理 OpenSharedResourceByName(d3dinterop.cpp)
+    target_link_libraries(mirrorcore PUBLIC d3d11)
+    # WGL_NV_DX_interop2: wglGetProcAddress/wglGetCurrentContext(d3dinterop.cpp)
+    target_link_libraries(mirrorcore PUBLIC opengl32)
 endif()

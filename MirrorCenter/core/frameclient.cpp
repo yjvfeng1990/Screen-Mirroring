@@ -100,6 +100,7 @@ void FrameClient::stopListening()
     m_width = m_height = m_stride = m_payloadSize = m_slot = 0;
     m_videoSize = QSize();
     m_latestFrame = QImage();
+    m_gpu = GpuFrameInfo();
 #ifdef _WIN32
     if (m_shmBase) {
         unmapFrameShm(m_shmBase);
@@ -137,6 +138,7 @@ void FrameClient::onClientDisconnected()
     m_videoSize = QSize();
     m_headerParsed = false;
     m_buffer.clear();
+    m_gpu = GpuFrameInfo();
 #ifdef _WIN32
     if (m_shmBase) {
         unmapFrameShm(m_shmBase);
@@ -261,7 +263,34 @@ bool FrameClient::tryParseFrame()
         m_headerParsed = true;
     }
 
+    // v3 GPU 帧(stride=0xFFFFFFFF): 负载在共享纹理, TCP 头即整帧。
+    // 只记录 GpuFrameInfo 供 GL 侧采样, 不 attach SHM、不做像素拷贝。
+    // slot 字段低 16 位=槽号, 高 16 位=纹理环世代(gen 服务端直发)。
+    if (m_stride == -1) {
+        m_gpu.valid = true;
+        m_gpu.slot = m_slot & 0xFFFF;
+        m_gpu.gen = (m_slot >> 16) & 0xFFFF;
+        m_gpu.width = m_width;
+        m_gpu.height = m_height;
+        m_gpu.seq = static_cast<quint64>(m_payloadSize);   // size 复用为帧序
+        m_gpu.port = m_port;
+        m_videoSize = QSize(m_width, m_height);
+        m_bufferOffset += kHeaderSize;
+        m_headerParsed = false;
+        if (++m_framesReceived == 1 || m_framesReceived % 150 == 0) {
+            qInfo() << "[frame] GPU frame #" << m_framesReceived
+                    << m_width << "x" << m_height
+                    << "slot" << m_gpu.slot << "gen" << m_gpu.gen;
+        }
+        emit frameReady();
+        return true;
+    }
+
     // v2: 负载在共享内存, TCP 头即整帧, 无需等待负载字节
+    // GPU→SHM 回退: 服务端中途回退(纹理环创建失败/拷贝矩阵全拒)后改发 SHM 头,
+    // 此处必须作废 GPU 帧信息 —— 否则 renderFrame 永远走 GPU 分支采样
+    // 已停止更新的旧共享纹理, 画面冻结且 SHM 新帧被忽略。
+    m_gpu.valid = 0;
 #ifdef _WIN32
     if (!m_shmBase) {
         // 服务端创建共享映射在首个帧之前, 首个头到达时必然已就绪; 失败则丢帧下一帧再试

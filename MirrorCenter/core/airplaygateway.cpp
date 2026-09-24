@@ -219,15 +219,10 @@ void AirPlayGateway::destroyInstance(Instance *inst)
 
     delete inst;
 
-    // 保持至少 1 个空闲实例(预置)
-    if (!m_stopping) {
-        int idle = 0;
-        for (Instance *i : std::as_const(m_instances))
-            if (!i->clientSock)
-                ++idle;
-        if (idle == 0 && m_instances.size() < m_cfg.maxInstances)
-            createInstance(QString());
-    }
+    // 不再预置空闲实例: 每断开一路, 该路实例按 30s 回收节奏退出, 不留常驻 uxplay
+    // 进程(旧逻辑"保持 1 个空闲预置"导致断开后进程永不消失)。
+    // 设备连入时 routeConnection 无空闲实例即按需 createInstance(9s 重试覆盖
+    // GStreamer 初始化); mDNS/网关监听独立于实例常驻, 广播不中断。
 }
 
 void AirPlayGateway::onSessionLog(Instance *inst, const QString &line)

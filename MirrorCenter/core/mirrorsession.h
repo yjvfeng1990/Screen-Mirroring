@@ -9,11 +9,11 @@
 #include <QTimer>
 #include <QElapsedTimer>
 
+#include "frameclient.h"   // GpuFrameInfo(latestGpuFrame 返回值需要完整类型)
+
 class QProcess;
 
 namespace mirror {
-
-class FrameClient;
 
 enum class BackendType {
     AirPlay,    // UxPlay
@@ -64,6 +64,9 @@ public:
 
     /// Latest frame (frame mode)
     QImage latestFrame() const;
+
+    /// 最近 GPU 帧信息(零拷贝模式; SHM 模式 valid=false)
+    FrameClient::GpuFrameInfo latestGpuFrame() const;
 
     /// Video size (frame mode)
     QSize videoSize() const;

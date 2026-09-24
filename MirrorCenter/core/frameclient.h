@@ -20,11 +20,29 @@ namespace mirror {
  *   负载在共享内存 Local\MirrorCenterFrames_<port> 的双槽中(每槽 1080p BGRA8 上限),
  *   TCP 只承载 28B 头,不再传输 8MB 负载(消除 TCP 回环 + append + memmove 开销)。
  *   slot 0/1 轮换;stride==0 → JPEG(旧式,负载也在共享槽),stride==w*4 → RAW BGRA8。
+ *
+ * GPU 帧模式(v3, 2026-09-24, 零拷贝):
+ *   stride==0xFFFFFFFF → GPU 帧:负载在共享纹理
+ *   Local\MirrorCenterSharedTex_<port>_g<gen>_<slot>,size 字段复用为帧序号,
+ *   slot 字段低 16 位=槽号、高 16 位=纹理环世代。本类只解析帧头并记录
+ *   GpuFrameInfo,像素由宿主 GL 侧经 WGL_NV_DX_interop2 直接采样。
  */
 class FrameClient : public QObject
 {
     Q_OBJECT
 public:
+    /// GPU 帧信息(stride=0xFFFFFFFF 帧; latestGpuFrame() 返回)
+    struct GpuFrameInfo
+    {
+        bool valid = false;      // GPU 模式已激活且至少收到一帧
+        int slot = 0;            // 共享纹理槽 0/1
+        int gen = 1;             // 纹理环世代(帧头高 16 位)
+        int width = 0;
+        int height = 0;
+        quint64 seq = 0;         // 帧序号(单调递增)
+        quint16 port = 0;        // 帧端口(纹理名 <port> 段)
+    };
+
     explicit FrameClient(QObject *parent = nullptr);
     ~FrameClient() override;
 
@@ -34,6 +52,9 @@ public:
 
     /// 最近一帧(未就绪返回 null)
     QImage latestFrame() const;
+
+    /// 最近 GPU 帧信息(仅 GPU 帧模式有效; SHM 模式 valid=false)
+    GpuFrameInfo latestGpuFrame() const { return m_gpu; }
 
     /// 视频尺寸(连接后填充)
     QSize videoSize() const;
@@ -88,6 +109,7 @@ private:
     QImage m_latestFrame;
     QSize m_videoSize;
     quint64 m_framesReceived = 0;
+    GpuFrameInfo m_gpu;      // 最近 GPU 帧信息(与 socket 同线程读写, 无锁)
     // 双缓冲:复用两块 QImage, 避免每帧 8MB(1080p BGRA)分配+释放。
     // tryParseFrame 写到"非显示中"的 buffer, 再整体换手给 m_latestFrame(隐式共享,零拷贝)。
     QImage m_ping, m_pong;

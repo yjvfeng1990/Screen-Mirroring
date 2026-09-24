@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <QDir>
+#include "d3dinterop.h"
 #endif
 
 using namespace mirror;
@@ -873,6 +874,10 @@ MIRROR_API mirror_result_t mirror_start_session(mirror_backend_t backend,
 
         argList << QStringLiteral("--port") << QString::number(framePort)
                 << QStringLiteral("--name") << name;
+        // GPU 零拷贝链路:宿主支持 WGL_NV_DX_interop2 才让服务端启用
+        // (服务端 GPU 模式下 SHM 槽不写数据, 宿主不支持就无画面)
+        if (D3DInterop::probeSupported())
+            argList << QStringLiteral("--gpu") << QStringLiteral("1");
     }
 #endif
 
@@ -985,6 +990,12 @@ MIRROR_API mirror_result_t mirror_start_miracast_group(
     argList << QStringLiteral("--ports") << portStrs.join(QLatin1Char(','))
             << QStringLiteral("--max") << QString::number(count)
             << QStringLiteral("--name") << name;
+#ifdef _WIN32
+    // GPU 零拷贝链路:宿主支持 WGL_NV_DX_interop2 才让服务端启用
+    // (服务端 GPU 模式下 SHM 槽不写数据, 宿主不支持就无画面)
+    if (D3DInterop::probeSupported())
+        argList << QStringLiteral("--gpu") << QStringLiteral("1");
+#endif
 
     // 创建句柄
     QVector<mirror_session_t *> handles;
@@ -1154,6 +1165,27 @@ MIRROR_API mirror_result_t mirror_get_frame(mirror_session_t *session,
     frame->height = session->frameCache.height();
     frame->stride = session->frameCache.bytesPerLine();
     frame->data   = session->frameCache.constBits();
+    return MIRROR_OK;
+}
+
+MIRROR_API mirror_result_t mirror_get_gpu_frame(mirror_session_t *session,
+                                                mirror_gpu_frame_t *frame)
+{
+    if (!session || !frame || !isHandleValid(session))
+        return MIRROR_ERR_INVALID_ARG;
+    *frame = mirror_gpu_frame_t{};
+    if (!session->core)
+        return MIRROR_ERR_NOT_FOUND;   // MICE/AirPlay 无 GPU 帧
+    const auto g = session->core->latestGpuFrame();
+    if (!g.valid)
+        return MIRROR_ERR_NOT_FOUND;   // GPU 模式未激活(服务端 SHM 路径)
+    frame->valid  = 1;
+    frame->slot   = g.slot;
+    frame->gen    = g.gen;
+    frame->width  = g.width;
+    frame->height = g.height;
+    frame->seq    = static_cast<long long>(g.seq);
+    frame->port   = g.port;
     return MIRROR_OK;
 }
 

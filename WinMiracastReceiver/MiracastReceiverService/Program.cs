@@ -1,12 +1,16 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Windows.Media;
 using Windows.Media.Core;
 using Windows.Media.Miracast;
 using Windows.Media.Playback;
+
+// 供 MiracastConsoleTest 复用 internal 的 FrameServerSocket/DxgiInterop 做 M1 GPU 链路验证
+[assembly: InternalsVisibleTo("MiracastConsoleTest")]
 
 namespace MiracastReceiverService
 {
@@ -118,6 +122,8 @@ namespace MiracastReceiverService
                     _maxConnections = m;
                 else if (args[i] == "--name" && i + 1 < args.Length)
                     _sessionName = args[i + 1];
+                else if (args[i] == "--gpu" && i + 1 < args.Length)
+                    FrameServerSocket.GpuEnabled = args[i + 1] == "1";   // M2 宿主就绪后默认开
             }
             if (_ports.Count == 0)
                 _ports.Add(0);

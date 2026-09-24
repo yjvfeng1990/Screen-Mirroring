@@ -10,4 +10,7 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
   </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\MiracastReceiverService\MiracastReceiverService.csproj" />
+  </ItemGroup>
 </Project>

@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 using Windows.Graphics.DirectX.Direct3D11;
+using WinRT;
 
 namespace MiracastReceiverService
 {
@@ -21,7 +22,8 @@ namespace MiracastReceiverService
         int GetInterface(ref Guid iid, out IntPtr ppv);
     }
 
-    [ComImport, Guid("30961379-4609-4a41-998e-54fe567ee26c"),
+    // 真实 IID 来自 SDK dxgi1_2.h: 尾段 ee0c1(曾误写 ee26c → QI E_NOINTERFACE)
+    [ComImport, Guid("30961379-4609-4a41-998e-54fe567ee0c1"),
      InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     internal interface IDXGIResource1
     {
@@ -45,36 +47,76 @@ namespace MiracastReceiverService
     internal static class SharedDxgi
     {
         private static readonly Guid IID_IDirect3DDXGIInterfaceAccess = new("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1");
-        private static readonly Guid IID_IDXGIResource1 = new("30961379-4609-4a41-998e-54fe567ee26c");
+        private static readonly Guid IID_IDXGIResource1 = new("30961379-4609-4a41-998e-54fe567ee0c1");
+        // d3d11.h 核实: DEFINE_GUID(IID_ID3D11Device,0xdb6f6ddb,0xac77,0x4e88,0x82,0x53,0x81,0x9d,0xf9,0xbb,0xf1,0x40)
+        private static readonly Guid IID_ID3D11Device = new("db6f6ddb-ac77-4e88-8253-819df9bbf140");
         private const uint DXGI_SHARED_RESOURCE_READ = 0x80000000;   // 只读共享访问
         private static volatile bool _probeDone;
+
+        [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        /// <summary>
+        /// 从 WinRT IDirect3DSurface(如 VideoFrame.CreateAsDirect3D11SurfaceBacked 的产物)
+        /// 提取底层 D3D11 设备: As<IDirect3DDxgiInterfaceAccess>(真 QI) → GetInterface
+        /// (IDXGIResource1) → IDXGIDeviceSubObject::GetDevice(ID3D11Device)。
+        /// 成功返回 AddRef 后的 ID3D11Device*(调用方负责 Marshal.Release), 失败 false。
+        /// 注意: 投影对象上 Marshal.GetIUnknownForObject+QI 拿到的是托管包装引用,
+        /// 对原生接口必 E_NOINTERFACE(2026-09-24 07:58 日志实证) → 必须走
+        /// WinRT.CastExtensions.As(经 NativeObject 对原生指针做真 QueryInterface)。
+        /// </summary>
+        public static bool TryGetSurfaceDevice(IDirect3DSurface surface, out IntPtr device)
+        {
+            device = IntPtr.Zero;
+            if (surface == null) return false;
+            IntPtr pRes = IntPtr.Zero;
+            try
+            {
+                var access = surface.As<IDirect3DDXGIInterfaceAccess>();
+                Guid iidRes = IID_IDXGIResource1;
+                int hr = access.GetInterface(ref iidRes, out pRes);
+                if (hr < 0)
+                {
+                    Program.Log("GpuDiag", new Exception($"GetInterface(IDXGIResource1) hr=0x{hr:X8}"));
+                    return false;
+                }
+                var res = (IDXGIResource1)Marshal.GetTypedObjectForIUnknown(pRes, typeof(IDXGIResource1));
+                Guid iidDev = IID_ID3D11Device;
+                hr = res.GetDevice(ref iidDev, out device);
+                if (hr < 0)
+                {
+                    Program.Log("GpuDiag", new Exception($"GetDevice(ID3D11Device) hr=0x{hr:X8}"));
+                    return false;
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Program.Log("GpuDiag", ex);
+                return false;
+            }
+            finally
+            {
+                if (pRes != IntPtr.Zero) Marshal.Release(pRes);
+            }
+        }
 
         /// <summary>
         /// 对 MediaPlayer 帧服务器生成的 surface 做一次性共享性探测(每进程仅一次)。
         /// 均为廉价 CPU 调用(无 GPU 同步), 可在帧回调线程执行。
-        /// 注意: CsWinRT 投影对象直接强转 COM 接口会抛 InvalidCastException(不触发 QI),
-        /// 必须 GetIUnknownForObject + 显式 QueryInterface 才能拿到原生接口。
+        /// 注意: 投影对象必须经 As<T>() 做真 QI(与 TryGetSurfaceDevice 同),
+        /// GetIUnknownForObject+QI 拿到的是托管包装引用, 历史上全部误报 E_NOINTERFACE。
         /// </summary>
         public static void ProbeOnce(IDirect3DSurface surface)
         {
             if (_probeDone) return;
             _probeDone = true;
 
-            IntPtr pUnk = IntPtr.Zero, pAccess = IntPtr.Zero, pRes = IntPtr.Zero;
+            IntPtr pRes = IntPtr.Zero;
             try
             {
-                // 1) 取底层 IUnknown → QI IDirect3DDXGIInterfaceAccess(官方路径)
-                pUnk = Marshal.GetIUnknownForObject(surface);
-                Guid iidAccess = IID_IDirect3DDXGIInterfaceAccess;
-                int hrQi = Marshal.QueryInterface(pUnk, ref iidAccess, out pAccess);
-                if (hrQi != 0)
-                {
-                    Program.Log("Probe", new Exception(
-                        $"QI IDirect3DDXGIInterfaceAccess failed hr=0x{hrQi:X8} — surface 疑似封闭(拿不到原生接口)"));
-                    return;
-                }
-                var access = (IDirect3DDXGIInterfaceAccess)Marshal.GetTypedObjectForIUnknown(
-                    pAccess, typeof(IDirect3DDXGIInterfaceAccess));
+                // 1) As<T>() 真 QI → IDirect3DDXGIInterfaceAccess(官方路径)
+                var access = surface.As<IDirect3DDXGIInterfaceAccess>();
 
                 // 2) GetInterface → IDXGIResource1
                 Guid iidRes = IID_IDXGIResource1;
@@ -96,8 +138,10 @@ namespace MiracastReceiverService
                     $"CreateSharedHandle(NT)=0x{hr3:X8}(h=0x{hNt.ToInt64():X})"));
 
                 // 仅验证用, 不跨进程传递, 释放句柄
+                // hNt 是 NT 内核句柄(非 COM 指针), 必须 CloseHandle;
+                // 曾误用 Marshal.Release → 按错误 vtable 调用 → NullReferenceException
                 if (hNt != IntPtr.Zero)
-                    Marshal.Release(hNt);
+                    CloseHandle(hNt);
             }
             catch (Exception ex)
             {
@@ -106,8 +150,6 @@ namespace MiracastReceiverService
             finally
             {
                 if (pRes != IntPtr.Zero) Marshal.Release(pRes);
-                if (pAccess != IntPtr.Zero) Marshal.Release(pAccess);
-                if (pUnk != IntPtr.Zero) Marshal.Release(pUnk);
             }
         }
     }
