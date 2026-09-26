@@ -1,6 +1,6 @@
-# MirrorCenter 技术文档：视频处理 / 显示布局 / 音频策略
+# MirrorCenter 技术文档：视频处理 / 显示布局 / 音频策略 / 窗口句柄 / 缩略图
 
-> 更新日期：2026-09-25（二次更新：同步早静音链路、fill 窗口稳定死区、GPU 未判定态 0.5s 快速重检、60s 空闲超时等最新调整）。本文档整理 Miracast/AirPlay 双后端投屏接收端的三大核心机制，所有数字与逻辑均已对照当前源码核实。
+> 更新日期：2026-09-25（四次更新：补充控制台缩略图机制；此前：窗口句柄提取、零拷贝方案、早静音链路、fill 窗口稳定死区、GPU 未判定态 0.5s 快速重检、60s 空闲超时）。本文档整理 Miracast/AirPlay 双后端投屏接收端的核心机制，所有数字与逻辑均已对照当前源码核实。
 
 ---
 
@@ -215,11 +215,84 @@ Miracast 命令链（SETMUTE 先存后发）：
 
 ---
 
+## 四、窗口句柄提取（AirPlay / Miracast）
+
+两条后端共用一套 **stdout 句柄上报协议**，宿主统一走 `attachWindow` 嵌入。
+
+### 4.1 统一提取协议（MirrorSession 层）
+
+- 后端子进程（uxplay / Miracast 桌面辅助进程）启动后向 stdout 输出 `WINDOW_HANDLE=<十进制句柄>`，窗口重建后会重复上报
+- MirrorSession 正则解析（[mirrorsession.cpp L269-275](file:///d:/develop/Screen%20Mirroring/MirrorCenter/core/mirrorsession.cpp#L269-L275)）：命中即记录 `m_windowHandle` → `setState(WindowReady)` → `emit windowReady(id, handle)`
+- `SessionManager` 转发为 `sessionWindowReady`（[sessionmanager.cpp L30-31](file:///d:/develop/Screen%20Mirroring/MirrorCenter/core/sessionmanager.cpp#L30-L31)），SDK 层映射为 `MIRROR_STATE_WINDOW_READY` 回调，`mirror_get_window()` 可随时查询（[mirror_api.cpp L1124](file:///d:/develop/Screen%20Mirroring/MirrorCenter/sdk/mirror_api.cpp#L1124)）
+- 宿主接入点：静态回调 `SessionView::onWindowReady`（[sessionview.cpp L854-858](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/sessionview.cpp#L854-L858)）转 `qulonglong` 后异步调 `attachWindow`；standalone 会话也可主动 `mirror_get_window` 立即嵌入（[sessionview.cpp L684-688](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/sessionview.cpp#L684-L688)）
+
+### 4.2 AirPlay：EnumWindows 自枚举上报（uxplay 进程内）
+
+[UxPlay-src/renderers/video_renderer.c L130-154](file:///d:/develop/Screen%20Mirroring/UxPlay-src/renderers/video_renderer.c#L130-L154)：
+- `EnumWindows` 回调 `find_d3d11_window_enum`：窗口标题含 **"Direct3D11"**（GStreamer `d3d11videosink` 自动创建的输出窗口）且 `GetWindowThreadProcessId` 等于**自身 pid** → 命中
+- 找到后 `g_print("WINDOW_HANDLE=<hwnd>")` 打到 stdout（`last_handle` 去重，窗口重建后重报）
+- 附带窗口修正：去边框样式、按内容比调整尺寸（L164-183），句柄 1s 缓存复扫（L212-219）
+- 宿主侧 [airplaygateway.cpp L291-301](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/airplaygateway.cpp#L291-L301)：收到句柄记录日志；**设备未连入时 `ShowWindow(SW_HIDE)` 隐藏空闲 d3d11 窗口**，连入后由 UI 嵌入显示
+
+### 4.3 Miracast：后端进程上报 + 预创建占位视图
+
+- Miracast 接收由后端子进程（桌面辅助进程 MiracastReceiverService.exe，[mirrorsession.cpp L135](file:///d:/develop/Screen%20Mirroring/MirrorCenter/core/mirrorsession.cpp#L135)）承担，同样走 `WINDOW_HANDLE=` stdout 协议上报
+- Miracast 路由的 `SessionView` 初始以 **GLFrameSurface**（QOpenGLWidget）承载帧协议渲染（[sessionview.cpp L505-540](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/sessionview.cpp#L505-L540)）；`attachWindow` 到来后替换内容区
+- **预创建占位视图**（[desktopwindow.cpp L535-600](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/desktopwindow.cpp#L535-L600) `createMiracastPlaceholders`）：Qt6 中向已显示窗口动态添加 QOpenGLWidget 会重建父 HWND（窗口重建/闪烁），故启动时预创建 4 个 `SessionView`，`startMiracast` 后由已有视图接管 SDK 会话句柄
+
+### 4.4 attachWindow 嵌入逻辑（两后端共用）
+
+[sessionview.cpp L1295-1369](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/sessionview.cpp#L1295-L1369)：
+1. 校验 HWND 有效性 → `QWindow::fromWinId` 包装为 Qt 窗口
+2. 置 `Qt::ForeignWindow` 标志（Qt 不拥有该窗口生命周期）
+3. `QWidget::createWindowContainer` 生成容器嵌入当前 `SessionView`
+4. 移除旧容器 / 占位视频区 / Miracast GLFrameSurface
+5. 成功后 `emit windowAttached()`（音频默认值等策略的接入点之一）
+- 进程 pid（来自后端进程）同时用于 WASAPI 音频会话匹配（§3.5）
+
+---
+
+## 五、控制台缩略图
+
+右侧按钮打开的控制面板（ControlPanel）中的实时缩略图——**不是静态截图，而是各会话视图定时"自拍" + 面板节拍拉取**。
+
+### 5.1 数据流
+
+```
+SessionView 定时抓图(缓存 m_lastThumb)
+   → DesktopWindow::thumbnailFor(sessionId)   desktopwindow.cpp L715
+   → provider 回调(main.cpp L137 注入)
+   → ControlPanel::refreshThumbnails() 贴到卡片
+```
+
+### 5.2 抓图端（SessionView，谁有画面谁抓）
+
+[sessionview.cpp L465-474](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/sessionview.cpp#L465-L474)：
+- 节拍：画面有变化 **1.2s** 抓一次，静止时 **3s**；视图不可见暂停，重新可见恢复（[L1455](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/sessionview.cpp#L1455)）
+- **去重指纹**（[thumbChanged L960-985](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/sessionview.cpp#L960-L985)）：缩成 16x9=144 像素指纹逐像素比较（RGB 通道差 >24 计为差异），差异 >**1%** 才算画面真变化——防静止画面反复换图
+
+### 5.3 抓图来源（captureThumbnail，按后端分两路）
+
+[sessionview.cpp L900-958](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/sessionview.cpp#L900-L958)：
+
+| 场景 | 方式 |
+|---|---|
+| 有嵌入原生窗口（AirPlay d3d11videosink / Miracast 外部窗口） | Win32 GDI：`PrintWindow(hwnd, memDc, PW_RENDERFULLCONTENT)`——该标志才能抓到 D3D11 实际渲染内容（而非空白窗口表面），失败回退 `BitBlt`，`GetDIBits` 转 QImage（top-down ARGB32_Premultiplied） |
+| Miracast 帧模式（GLFrameSurface/QOpenGLWidget，无外部窗口） | `m_videoLabel->grab()`——Qt 控件级抓图，直接读回 GPU 渲染的当前帧 |
+
+### 5.4 显示端（ControlPanel）
+
+[controlpanel.cpp L61-66](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/controlpanel.cpp#L61-L66)：
+- **800ms 节拍 timer**（`m_thumbTimer`），且**仅面板展开时工作**（收起不抓图）
+- `refreshThumbnails()` 经 provider 拉最新 QPixmap 贴到卡片（缩略图 + 名称/IP/状态），卡片复用以便平滑更新
+
+---
+
 ## 附：相关文件索引
 
 | 文件 | 职责 |
 |---|---|
-| [desktopwindow.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/desktopwindow.cpp) | 主窗口：relayout/分档/fillMode/音频策略 |
+| [desktopwindow.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/desktopwindow.cpp) | 主窗口：relayout/分档/fillMode/音频策略/占位视图 |
 | [sessionview.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/sessionview.cpp) | 单路视图：渲染/黑边检测裁切/静音下发 |
 | [frameclient.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/core/frameclient.cpp) | 帧协议客户端（SHM/GPU 双路径、SETMUTE 先存后发） |
 | [mirrorsession.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/core/mirrorsession.cpp) | Miracast 会话宿主侧（GL 渲染/空闲超时/frameConnected） |
@@ -228,3 +301,5 @@ Miracast 命令链（SETMUTE 先存后发）：
 | [FrameServerSocket.cs](file:///d:/develop/Screen%20Mirroring/WinMiracastReceiver/MiracastReceiverService/FrameServerSocket.cs) | 服务端：GPU 拷贝/共享纹理/SETEDGE/SETMUTE |
 | [Program.cs](file:///d:/develop/Screen%20Mirroring/WinMiracastReceiver/MiracastReceiverService/Program.cs) | 服务端主程序：会话生命周期/空闲拆除 |
 | [audiocontrol.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/audiocontrol.cpp) | WASAPI 音频会话控制 |
+| [video_renderer.c](file:///d:/develop/Screen%20Mirroring/UxPlay-src/renderers/video_renderer.c) | uxplay 渲染器：D3D11 窗口枚举与 WINDOW_HANDLE 上报 |
+| [controlpanel.cpp](file:///d:/develop/Screen%20Mirroring/MirrorCenter/app/controlpanel.cpp) | 控制面板：会话列表卡片/缩略图节拍拉取 |
